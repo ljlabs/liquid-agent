@@ -93,3 +93,36 @@ class HealthResponse(BaseModel):
     sdk_available: bool
     sdk_version: Optional[str] = None
     active_sessions: int
+
+
+class DBSessionInfo(BaseModel):
+    """Persistent session info from the database."""
+    id: str
+    title: str
+    cwd: str
+    model: str
+    permission_mode: PermissionMode
+    status: str
+    created_at: float
+    updated_at: float
+
+
+class DBSessionListResponse(BaseModel):
+    sessions: list[DBSessionInfo]
+
+
+class DBMessageInfo(BaseModel):
+    """A persisted message from the database."""
+    id: int
+    session_id: str
+    role: str
+    type: str
+    content: str
+    tool_name: Optional[str] = None
+    tool_id: Optional[str] = None
+    tool_input: Optional[str] = None
+    created_at: float
+
+
+class DBMessageListResponse(BaseModel):
+    messages: list[DBMessageInfo]

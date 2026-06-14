@@ -1,3 +1,5 @@
 **/*.pyc
 **/*.zip
 **/venv/*
+server/data/
+server/data/
