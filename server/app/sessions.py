@@ -19,62 +19,80 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Optional
 
-# ---------- Mock Claude Agent SDK ----------
+try:
+    from claude_agent_sdk import (
+        AssistantMessage,
+        ClaudeAgentOptions,
+        ClaudeSDKClient,
+        ResultMessage,
+        SystemMessage,
+        TextBlock,
+        ThinkingBlock,
+        ToolResultBlock,
+        ToolUseBlock,
+        UserMessage,
+    )
+    from claude_agent_sdk.types import StreamEvent, PermissionResultAllow, PermissionResultDeny, ToolPermissionContext
 
-class AssistantMessage: pass
-class ClaudeAgentOptions:
-    def __init__(self, **kwargs):
-        for k, v in kwargs.items(): setattr(self, k, v)
+    SDK_AVAILABLE = True
+    IS_MOCK = False
 
-class ClaudeSDKClient:
-    def __init__(self, options=None):
-        self.options = options
-        self._interrupt = False
-        self._queue = asyncio.Queue()
-
-    async def connect(self): pass
-    async def disconnect(self): pass
-    async def interrupt(self): self._interrupt = True
-    async def set_permission_mode(self, mode): pass
-    async def set_model(self, model): pass
+except ImportError:  # pragma: no cover
+    # ---------- Mock Claude Agent SDK Fallback ----------
+    class AssistantMessage: pass
+    class ClaudeAgentOptions:
+        def __init__(self, **kwargs):
+            for k, v in kwargs.items(): setattr(self, k, v)
     
-    async def query(self, content):
-        self._interrupt = False
-        # Simulate a simple response
-        events = [
-            {"type": "content_block_start", "content_block": {"type": "thinking"}},
-            {"type": "content_block_delta", "delta": {"type": "thinking_delta", "thinking": "I am thinking about: " + str(content)}},
-            {"type": "content_block_stop"},
-            {"type": "content_block_start", "content_block": {"type": "text", "text": ""}},
-            {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "This is a mock response to: " + str(content)}},
-            {"type": "content_block_stop"},
-            {"type": "message_stop"}
-        ]
-        for e in events:
-            if self._interrupt: break
-            await self._queue.put(e)
-            await asyncio.sleep(0.1)
+    class ClaudeSDKClient:
+        def __init__(self, options=None):
+            self.options = options
+            self._interrupt = False
+            self._queue = asyncio.Queue()
 
-    async def receive_response(self):
-        while True:
-            ev = await self._queue.get()
-            yield ev
-            if ev.get("type") == "message_stop": break
+        async def connect(self): pass
+        async def disconnect(self): pass
+        async def interrupt(self): self._interrupt = True
+        async def set_permission_mode(self, mode): pass
+        async def set_model(self, model): pass
+        
+        async def query(self, content):
+            self._interrupt = False
+            events = [
+                {"type": "content_block_start", "content_block": {"type": "thinking"}},
+                {"type": "content_block_delta", "delta": {"type": "thinking_delta", "thinking": "I am thinking (MOCK): " + str(content)}},
+                {"type": "content_block_stop"},
+                {"type": "content_block_start", "content_block": {"type": "text", "text": ""}},
+                {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Mock response to: " + str(content)}},
+                {"type": "content_block_stop"},
+                {"type": "message_stop"}
+            ]
+            for e in events:
+                if self._interrupt: break
+                await self._queue.put(e)
+                await asyncio.sleep(0.01)
 
-class ResultMessage: pass
-class SystemMessage: pass
-class TextBlock: pass
-class ThinkingBlock: pass
-class ToolResultBlock: pass
-class ToolUseBlock: pass
-class UserMessage: pass
+        async def receive_response(self):
+            while True:
+                ev = await self._queue.get()
+                yield ev
+                if ev.get("type") == "message_stop": break
 
-StreamEvent = Any
-PermissionResultAllow = Any
-PermissionResultDeny = Any
-ToolPermissionContext = Any
+    class ResultMessage: pass
+    class SystemMessage: pass
+    class TextBlock: pass
+    class ThinkingBlock: pass
+    class ToolResultBlock: pass
+    class ToolUseBlock: pass
+    class UserMessage: pass
 
-SDK_AVAILABLE = True
+    StreamEvent = Any
+    PermissionResultAllow = Any
+    PermissionResultDeny = Any
+    ToolPermissionContext = Any
+
+    SDK_AVAILABLE = True
+    IS_MOCK = True
 
 # -------------------------------------------
 
@@ -134,6 +152,8 @@ class Session:
             system_prompt=self.system_prompt,
             permission_mode=self.permission_mode,
             max_turns=self.max_turns,
+            allowed_tools=self.allowed_tools or [],
+            disallowed_tools=self.disallowed_tools or [],
         )
 
         self._client: Optional[ClaudeSDKClient] = None
@@ -155,6 +175,7 @@ class Session:
                 pass
             finally:
                 self._client = None
+        self.status = "closed"
 
     async def interrupt(self) -> None:
         """Interrupt the current in-flight turn."""
@@ -243,51 +264,48 @@ class Session:
         """
         Map a raw SDK event into the JSON shape our UI expects.
         """
-        # Note: In a real implementation, we would use isinstance() checks
-        # on the SDK's event classes. Since we're mocking, we'll use dict-get.
+        # If we are in mock mode, event is already a dict (see ClaudeSDKClient.query)
+        # If we are in real SDK mode, event is a StreamEvent object or dict depending on SDK version
         
-        if not isinstance(event, dict):
-            return None
-
-        etype = event.get("type")
+        etype = None
+        if isinstance(event, dict):
+            etype = event.get("type")
+        else:
+            etype = getattr(event, "type", None)
 
         if etype == "content_block_delta":
-            delta = event.get("delta", {})
-            delta_type = delta.get("type")
+            delta = event.get("delta", {}) if isinstance(event, dict) else getattr(event, "delta", {})
+            delta_type = delta.get("type") if isinstance(delta, dict) else getattr(delta, "type", None)
             if delta_type == "text_delta":
-                return {"type": "text", "data": delta.get("text", "")}
+                text = delta.get("text", "") if isinstance(delta, dict) else getattr(delta, "text", "")
+                return {"type": "text", "data": text}
             elif delta_type == "thinking_delta":
-                return {"type": "thinking", "data": delta.get("thinking", ""), "done": False}
-            elif delta_type == "input_json_delta":
-                # Partial tool-input JSON; UI shows the tool block once
-                # content_block_start fires, so partial input deltas are
-                # safe to ignore for rendering purposes.
-                pass
+                thinking = delta.get("thinking", "") if isinstance(delta, dict) else getattr(delta, "thinking", "")
+                return {"type": "thinking", "data": thinking, "done": False}
 
         elif etype == "content_block_start":
-            block = event.get("content_block", {})
-            if block.get("type") == "tool_use":
+            block = event.get("content_block", {}) if isinstance(event, dict) else getattr(event, "content_block", {})
+            block_type = block.get("type") if isinstance(block, dict) else getattr(block, "type", None)
+            if block_type == "tool_use":
                 return {
                     "type": "tool_use",
-                    "tool_id": block.get("id"),
-                    "name": block.get("name"),
-                    "input": block.get("input", {}) or {},
+                    "tool_id": block.get("id") if isinstance(block, dict) else getattr(block, "id", None),
+                    "name": block.get("name") if isinstance(block, dict) else getattr(block, "name", None),
+                    "input": (block.get("input", {}) or {}) if isinstance(block, dict) else (getattr(block, "input", {}) or {}),
                 }
-            elif block.get("type") == "thinking":
+            elif block_type == "thinking":
                 return {"type": "thinking", "data": "", "done": False, "start": True}
 
         elif etype == "content_block_stop":
-            # If the block that just finished was a thinking block, tell the UI
-            # (In a real SDK, we'd track state to know which block stopped).
             return {"type": "thinking", "done": True}
 
         elif etype == "message_stop":
             # Final result / usage
             return {
                 "type": "result",
-                "usage": {"input_tokens": 100, "output_tokens": 50},
-                "duration_ms": 500,
-                "cost_usd": 0.0015
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+                "duration_ms": 0,
+                "cost_usd": 0.0
             }
 
         return None

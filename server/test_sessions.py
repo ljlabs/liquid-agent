@@ -7,6 +7,12 @@ import pytest
 from app.sessions import Session, SessionManager
 
 
+def test_sdk_availability():
+    """Check if the SDK is real or mocked."""
+    from app.sessions import SDK_AVAILABLE, IS_MOCK
+    print(f"\nSDK_AVAILABLE: {SDK_AVAILABLE}, IS_MOCK: {IS_MOCK}")
+    assert SDK_AVAILABLE is True
+
 @pytest.mark.asyncio
 async def test_session_initialization():
     """Test that a session can be initialized with minimal parameters."""

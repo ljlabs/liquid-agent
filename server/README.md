@@ -36,7 +36,7 @@ export ANTHROPIC_API_KEY=sk-ant-...
 ## Run
 
 ```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8787 --reload
+.\venv\Scripts\python.exe -m app.run
 ```
 
 Open `http://localhost:8787` — the UI is served directly by FastAPI's
