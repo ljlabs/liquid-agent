@@ -16,8 +16,13 @@ import asyncio
 import time
 import uuid
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Optional
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 try:
     from claude_agent_sdk import (
@@ -39,6 +44,7 @@ try:
 
 except ImportError:  # pragma: no cover
     # ---------- Mock Claude Agent SDK Fallback ----------
+    logger.warning("claude_agent_sdk not found, using Mock implementation")
     class AssistantMessage: pass
     class ClaudeAgentOptions:
         def __init__(self, **kwargs):
@@ -50,18 +56,19 @@ except ImportError:  # pragma: no cover
             self._interrupt = False
             self._queue = asyncio.Queue()
 
-        async def connect(self): pass
-        async def disconnect(self): pass
-        async def interrupt(self): self._interrupt = True
-        async def set_permission_mode(self, mode): pass
-        async def set_model(self, model): pass
+        async def connect(self): logger.info("Mock connect")
+        async def disconnect(self): logger.info("Mock disconnect")
+        async def interrupt(self): 
+            logger.info("Mock interrupt")
+            self._interrupt = True
+        async def set_permission_mode(self, mode): logger.info(f"Mock set_permission_mode: {mode}")
+        async def set_model(self, model): logger.info(f"Mock set_model: {model}")
         
         async def query(self, content):
+            logger.info(f"Mock query: {content}")
             self._interrupt = False
+            # Very minimal mock response
             events = [
-                {"type": "content_block_start", "content_block": {"type": "thinking"}},
-                {"type": "content_block_delta", "delta": {"type": "thinking_delta", "thinking": "I am thinking (MOCK): " + str(content)}},
-                {"type": "content_block_stop"},
                 {"type": "content_block_start", "content_block": {"type": "text", "text": ""}},
                 {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Mock response to: " + str(content)}},
                 {"type": "content_block_stop"},
@@ -163,16 +170,19 @@ class Session:
     async def connect(self) -> None:
         """Establish the underlying SDK connection."""
         if self._client is None:
+            logger.info(f"Connecting to Claude SDK for session {self.session_id}...")
             self._client = ClaudeSDKClient(options=self._options)
             await self._client.connect()
+            logger.info(f"Connected to Claude SDK for session {self.session_id}")
 
     async def close(self) -> None:
         """Close the SDK connection and clean up."""
         if self._client is not None:
+            logger.info(f"Closing session {self.session_id}...")
             try:
                 await self._client.disconnect()
-            except Exception:  # pragma: no cover
-                pass
+            except Exception as e:  # pragma: no cover
+                logger.error(f"Error disconnecting session {self.session_id}: {e}")
             finally:
                 self._client = None
         self.status = "closed"
@@ -180,12 +190,14 @@ class Session:
     async def interrupt(self) -> None:
         """Interrupt the current in-flight turn."""
         if self._client is not None:
+            logger.info(f"Interrupting turn for session {self.session_id}")
             await self._client.interrupt()
 
     async def set_permission_mode(self, mode: str) -> None:
         """Change the agent's permission mode mid-session."""
         self.permission_mode = mode
         if self._client is not None:
+            logger.info(f"Setting permission mode to {mode} for session {self.session_id}")
             try:
                 await self._client.set_permission_mode(mode)
             except (AttributeError, NotImplementedError):  # pragma: no cover
@@ -195,6 +207,7 @@ class Session:
         """Change the agent's model mid-session."""
         self.model = model
         if self._client is not None:
+            logger.info(f"Setting model to {model} for session {self.session_id}")
             try:
                 await self._client.set_model(model)
             except (AttributeError, NotImplementedError):  # pragma: no cover
@@ -236,37 +249,59 @@ class Session:
             await self.connect()
 
         self.status = "running"
-        
-        # In a real app we might handle image_paths or planning_mode flags here
-        # and pass them into the SDK's query() call.
-        content = message
+        logger.info(f"Starting turn for session {self.session_id}. Message: {message}")
 
         try:
             # 1. Start the turn
             assert self._client is not None
-            await self._client.query(content)
+            await self._client.query(message)
 
             # 2. Consume events from the SDK
             async for msg in self._client.receive_response():
+                logger.info(f"Turn response for session {self.session_id}. Message: {msg}")
                 event = await self._handle_sdk_event(msg)
                 if event:
                     yield event
-                    if event["type"] == "planning_complete" and planning_mode:
-                        # Wait for UI to approve the plan before continuing
-                        # (The SDK handles the actual pause if configured,
-                        # but we can also manage it here).
-                        pass
 
         finally:
             self.status = "idle"
+            logger.info(f"Turn complete for session {self.session_id}")
 
     async def _handle_sdk_event(self, event: Any) -> Optional[dict[str, Any]]:
         """
         Map a raw SDK event into the JSON shape our UI expects.
         """
-        # If we are in mock mode, event is already a dict (see ClaudeSDKClient.query)
-        # If we are in real SDK mode, event is a StreamEvent object or dict depending on SDK version
-        
+        # Handle real SDK objects first
+        if not IS_MOCK:
+            if isinstance(event, AssistantMessage):
+                text_content = ""
+                for block in event.content:
+                    if isinstance(block, TextBlock):
+                        text_content += block.text
+                    elif isinstance(block, ThinkingBlock):
+                        # Yield a separate event for thinking blocks if possible,
+                        # but if we are returning a single dict we should prioritize text.
+                        # For now, let's just make sure text shows up.
+                        pass
+                if text_content:
+                    return {"type": "text", "data": text_content}
+                return None
+
+            if isinstance(event, ResultMessage):
+                return {
+                    "type": "result",
+                    "usage": event.usage,
+                    "duration_ms": event.duration_ms,
+                    "cost_usd": event.total_cost_usd,
+                    "num_turns": event.num_turns,
+                    "stop_reason": event.stop_reason,
+                    "is_error": event.is_error
+                }
+
+            if isinstance(event, SystemMessage):
+                return {"type": "system", "subtype": event.subtype, "data": event.data}
+
+        # Handle dict-based events (deltas, or mock events)
         etype = None
         if isinstance(event, dict):
             etype = event.get("type")
@@ -300,13 +335,8 @@ class Session:
             return {"type": "thinking", "done": True}
 
         elif etype == "message_stop":
-            # Final result / usage
-            return {
-                "type": "result",
-                "usage": {"input_tokens": 0, "output_tokens": 0},
-                "duration_ms": 0,
-                "cost_usd": 0.0
-            }
+            # This is handled for deltas, but ResultMessage is better for full objects
+            return {"type": "done"}
 
         return None
 
