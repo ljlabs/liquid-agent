@@ -195,8 +195,8 @@ function appendUserMessage(text) {
   div.className = 'msg user';
   div.innerHTML = `<div class="avatar">U</div><div class="msg-body">
     <div class="msg-meta"><span class="role">You</span><span>${new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</span></div>
-    <div class="msg-content"></div></div>`;
-  div.querySelector('.msg-content').textContent = text;
+    <div class="msg-content markdown-body"></div></div>`;
+  div.querySelector('.msg-content').innerHTML = marked.parse(text);
   conversation.appendChild(div);
   scrollToBottom();
 }
@@ -206,7 +206,7 @@ function appendAssistantStub() {
   div.className = 'msg assistant';
   div.innerHTML = `<div class="avatar">A</div><div class="msg-body">
     <div class="msg-meta"><span class="role">Claude</span><span>${new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</span></div>
-    <div class="msg-content"><span class="cursor-blink"></span></div></div>`;
+    <div class="msg-content markdown-body"><span class="cursor-blink"></span></div></div>`;
   conversation.appendChild(div);
   scrollToBottom();
   return div;
@@ -217,10 +217,32 @@ function appendAssistantMessage(text) {
   div.className = 'msg assistant';
   div.innerHTML = `<div class="avatar">A</div><div class="msg-body">
     <div class="msg-meta"><span class="role">Claude</span><span></span></div>
-    <div class="msg-content"></div></div>`;
-  div.querySelector('.msg-content').textContent = text;
+    <div class="msg-content markdown-body"></div></div>`;
+  
+  renderAssistantContent(div, text);
   conversation.appendChild(div);
   scrollToBottom();
+}
+
+function renderAssistantContent(msgEl, fullText) {
+  const contentEl = msgEl.querySelector('.msg-content');
+  const bodyEl = msgEl.querySelector('.msg-body');
+  
+  // Extract <thought> tags
+  const thoughtRegex = /<thought>([\s\S]*?)<\/thought>/g;
+  let text = fullText;
+  let match;
+  
+  // Clear existing content except metadata
+  contentEl.innerHTML = '';
+
+  while ((match = thoughtRegex.exec(fullText)) !== null) {
+    const thoughtContent = match[1];
+    appendOrUpdateThinking(msgEl, { data: thoughtContent, done: true });
+    text = text.replace(match[0], '');
+  }
+
+  contentEl.innerHTML = marked.parse(text.trim());
 }
 
 function escapeHtml(s) {
@@ -354,11 +376,20 @@ function handleStreamEvent(event, msgEl) {
       break;
 
     case 'text':
-      if (!contentEl.innerHTML.includes('cursor-blink')) {
-        contentEl.textContent += event.data;
-      } else {
-        const cursor = contentEl.querySelector('.cursor-blink');
-        cursor.before(document.createTextNode(event.data));
+      // Store full accumulated text in a data attribute to re-render properly
+      let currentText = msgEl.dataset.fullText || '';
+      currentText += event.data;
+      msgEl.dataset.fullText = currentText;
+
+      renderAssistantContent(msgEl, currentText);
+      // Keep cursor if not done
+      if (!currentText.includes('</thought>') || currentText.split('</thought>').pop().trim() !== '') {
+         const contentEl = msgEl.querySelector('.msg-content');
+         if (!contentEl.querySelector('.cursor-blink')) {
+           const span = document.createElement('span');
+           span.className = 'cursor-blink';
+           contentEl.appendChild(span);
+         }
       }
       scrollToBottom();
       break;
