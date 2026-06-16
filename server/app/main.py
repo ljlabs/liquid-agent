@@ -59,8 +59,10 @@ from .models import (
     SetModelRequest,
     SetPermissionModeRequest,
     StreamRequest,
+    ToolDefaultsResponse,
+    ToolRuleInfo,
 )
-from .sessions import SDK_AVAILABLE, SessionManager
+from .sessions import DEFAULT_TOOL_RULES, SDK_AVAILABLE, SessionManager
 from . import database as db
 
 
@@ -136,6 +138,7 @@ async def create_session(req: SessionCreateRequest) -> SessionInfo:
         cwd=session.cwd or "",
         model=session.model,
         permission_mode=session.permission_mode,
+        tool_rules=json.dumps(session.get_tool_rules()),
     )
 
     return _session_info(session)
@@ -224,10 +227,15 @@ async def interrupt_session(session_id: str) -> dict[str, bool]:
 @app.post("/v1/sessions/{session_id}/permission-mode")
 async def set_permission_mode(session_id: str, req: SetPermissionModeRequest) -> dict[str, str]:
     session = manager.get(session_id)
-    if session is None:
+    if not session:
         raise HTTPException(404, "session not found")
     await session.set_permission_mode(req.permission_mode)
+
+    # Persist to DB
+    await db.update_session(session_id, permission_mode=req.permission_mode)
+
     return {"permission_mode": session.permission_mode}
+
 
 
 @app.post("/v1/sessions/{session_id}/model")
@@ -242,10 +250,40 @@ async def set_model(session_id: str, req: SetModelRequest) -> dict[str, str]:
 @app.post("/v1/sessions/{session_id}/tool-rule")
 async def set_tool_rule(session_id: str, req: PermissionRuleUpdate) -> dict[str, str]:
     session = manager.get(session_id)
-    if session is None:
+    if not session:
         raise HTTPException(404, "session not found")
     session.set_tool_rule(req.tool_name, req.rule)
+
+    # Persist to DB
+    rules = session.get_tool_rules()
+    await db.update_session(session_id, tool_rules=json.dumps(rules))
+
     return {"tool": req.tool_name, "rule": req.rule}
+
+
+
+@app.get("/v1/sessions/{session_id}/tool-rules", response_model=ToolDefaultsResponse)
+async def get_session_tool_rules(session_id: str) -> ToolDefaultsResponse:
+    """Return the effective tool rules for a live session."""
+    session = manager.get(session_id)
+    if session is None:
+        raise HTTPException(404, "session not found")
+    rules = session.get_tool_rules()
+    return ToolDefaultsResponse(
+        tools=list(DEFAULT_TOOL_RULES.keys()),
+        rules=[ToolRuleInfo(tool=name, rule=rules[name]) for name in DEFAULT_TOOL_RULES],
+    )
+
+
+@app.get("/v1/tool-defaults", response_model=ToolDefaultsResponse)
+async def get_tool_defaults() -> ToolDefaultsResponse:
+    """Canonical tool list and the default rule for each, before any
+    session is created. The UI uses this to render the sidebar when no
+    session is active so it never displays mocked values."""
+    return ToolDefaultsResponse(
+        tools=list(DEFAULT_TOOL_RULES.keys()),
+        rules=[ToolRuleInfo(tool=name, rule=rule) for name, rule in DEFAULT_TOOL_RULES.items()],
+    )
 
 
 # ------------------------------------------------------------------
@@ -259,6 +297,9 @@ async def respond_permission(req: PermissionDecisionRequest) -> dict[str, bool]:
         if session.resolve_permission(
             req.request_id, req.approved, req.always, req.deny_message
         ):
+            if req.always:
+                rules = session.get_tool_rules()
+                await db.update_session(session.session_id, tool_rules=json.dumps(rules))
             return {"resolved": True}
     raise HTTPException(404, "permission request not found (it may have already timed out)")
 
@@ -273,6 +314,16 @@ async def stream(req: StreamRequest) -> StreamingResponse:
     if not SDK_AVAILABLE:
         raise HTTPException(503, "claude_agent_sdk is not installed on the server")
 
+    # Persist a DB record if one doesn't exist yet for this session
+    db_session = await db.get_session(req.session_id) if req.session_id else None
+    
+    initial_tool_rules = None
+    if db_session and db_session.get("tool_rules"):
+        try:
+            initial_tool_rules = json.loads(db_session["tool_rules"])
+        except Exception:
+            pass
+
     session = await manager.get_or_create(
         req.session_id,
         cwd=req.cwd,
@@ -281,13 +332,12 @@ async def stream(req: StreamRequest) -> StreamingResponse:
         permission_mode=req.permission_mode or "default",
         allowed_tools=req.allowed_tools,
         disallowed_tools=req.disallowed_tools,
+        tool_rules=initial_tool_rules,
         mcp_servers=req.mcp_servers,
         max_turns=req.max_turns,
         include_partial_messages=req.include_partial_messages,
     )
 
-    # Persist a DB record if one doesn't exist yet for this session
-    db_session = await db.get_session(session.session_id)
     if db_session is None:
         # Generate a title from the first message (first 60 chars)
         title = req.message[:60].strip() or "New Session"
@@ -297,6 +347,7 @@ async def stream(req: StreamRequest) -> StreamingResponse:
             cwd=session.cwd or "",
             model=session.model,
             permission_mode=session.permission_mode,
+            tool_rules=json.dumps(session.get_tool_rules()),
         )
     elif db_session.get("title") == "New Session":
         # Update title from the first real message if it's still the default
@@ -315,6 +366,7 @@ async def stream(req: StreamRequest) -> StreamingResponse:
 
     if req.auto_approve and session.permission_mode == "default":
         await session.set_permission_mode("acceptEdits")
+        await db.update_session(session.session_id, permission_mode="acceptEdits")
 
     async def event_stream() -> AsyncIterator[str]:
         # Accumulate assistant text for persistence
@@ -357,6 +409,13 @@ async def stream(req: StreamRequest) -> StreamingResponse:
                                 content=content,
                             )
                 elif etype == "tool_use":
+                    if assistant_text_buffer:
+                        await db.add_message(
+                            session_id=session.session_id,
+                            role="assistant",
+                            content=assistant_text_buffer,
+                        )
+                        assistant_text_buffer = ""
                     tool_data = {
                         "tool_id": event.get("tool_id"),
                         "name": event.get("name"),

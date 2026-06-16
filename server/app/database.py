@@ -7,6 +7,7 @@ app can stay fully async without blocking the event loop on DB I/O.
 
 from __future__ import annotations
 
+import json
 import aiosqlite
 import time
 from pathlib import Path
@@ -44,6 +45,7 @@ async def _init_schema(db: aiosqlite.Connection) -> None:
             cwd             TEXT NOT NULL DEFAULT '',
             model           TEXT NOT NULL DEFAULT 'claude-sonnet-4-6',
             permission_mode TEXT NOT NULL DEFAULT 'default',
+            tool_rules      TEXT,
             status          TEXT NOT NULL DEFAULT 'idle',
             created_at      REAL NOT NULL,
             updated_at      REAL NOT NULL
@@ -63,6 +65,14 @@ async def _init_schema(db: aiosqlite.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
     """)
+    # Backwards-compat: add tool_rules JSON column if it doesn't already
+    # exist. Older databases (created before this column shipped) get the
+    # column on next startup; new databases get it implicitly via the
+    # CREATE TABLE block above mirroring the final shape.
+    cursor = await db.execute("PRAGMA table_info(sessions)")
+    cols = {row["name"] for row in await cursor.fetchall()}
+    if "tool_rules" not in cols:
+        await db.execute("ALTER TABLE sessions ADD COLUMN tool_rules TEXT NOT NULL DEFAULT ''")
     await db.commit()
 
 
@@ -77,14 +87,16 @@ async def create_session(
     cwd: str = "",
     model: str = "claude-sonnet-4-6",
     permission_mode: str = "default",
-) -> dict:
+    tool_rules: str | None = None,
+    ) -> None:
     now = time.time()
     db = await get_db()
     await db.execute(
-        """INSERT INTO sessions (id, title, cwd, model, permission_mode, status, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, 'idle', ?, ?)""",
-        (session_id, title, cwd, model, permission_mode, now, now),
+        """INSERT INTO sessions (id, title, cwd, model, permission_mode, tool_rules, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (session_id, title, cwd, model, permission_mode, tool_rules, "idle", now, now),
     )
+
     await db.commit()
     return await get_session(session_id)
 

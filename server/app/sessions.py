@@ -67,6 +67,71 @@ except ImportError:  # pragma: no cover
         async def query(self, content):
             logger.info(f"Mock query: {content}")
             self._interrupt = False
+            
+            # Simulated tool trigger: "mock_tool: <tool_name>"
+            if isinstance(content, str) and content.startswith("mock_tool:"):
+                parts = content.split(":")
+                tool_name = parts[1].strip()
+                tool_input = {"command": "echo hello"}
+                tool_id = "mock_tool_id"
+                
+                await self._queue.put({
+                    "type": "content_block_start",
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": tool_id,
+                        "name": tool_name,
+                        "input": tool_input
+                    }
+                })
+                await asyncio.sleep(0.01)
+                
+                class MockContext:
+                    display_name = tool_name
+                    description = f"Mock description for {tool_name}"
+                    title = f"Run {tool_name}"
+                
+                context = MockContext()
+                
+                if self.options and getattr(self.options, "can_use_tool", None):
+                    try:
+                        perm_res = await self.options.can_use_tool(tool_name, tool_input, context)
+                        is_allowed = False
+                        if isinstance(perm_res, PermissionResultAllow) or type(perm_res).__name__ == "PermissionResultAllow":
+                            is_allowed = True
+                        elif hasattr(perm_res, "approved"):
+                            is_allowed = perm_res.approved
+                            
+                        if is_allowed:
+                            await self._queue.put({
+                                "type": "tool_result",
+                                "tool_id": tool_id,
+                                "output": "mock tool output success"
+                            })
+                        else:
+                            msg = getattr(perm_res, "message", "Denied by user")
+                            await self._queue.put({
+                                "type": "tool_error",
+                                "tool_id": tool_id,
+                                "error": f"Error: {msg}"
+                            })
+                    except Exception as e:
+                        await self._queue.put({
+                            "type": "tool_error",
+                            "tool_id": tool_id,
+                            "error": str(e)
+                        })
+                else:
+                    await self._queue.put({
+                        "type": "tool_result",
+                        "tool_id": tool_id,
+                        "output": "mock tool output success (no perm check)"
+                    })
+                
+                await asyncio.sleep(0.01)
+                await self._queue.put({"type": "message_stop"})
+                return
+
             # Very minimal mock response
             events = [
                 {"type": "content_block_start", "content_block": {"type": "text", "text": ""}},
@@ -108,6 +173,25 @@ except ImportError:  # pragma: no cover
 # in the UI sidebar.
 DEFAULT_AUTO_ALLOW_TOOLS = {"Read", "Glob", "Grep", "WebFetch", "WebSearch", "TodoWrite"}
 
+# Canonical tool list shown in the UI sidebar. Each entry has the default
+# rule applied to a fresh session: "allow" auto-passes, "ask" emits a
+# permission_request, "deny" blocks the tool outright. The same list is
+# served from the server so the UI renders these values rather than
+# hardcoded markup.
+DEFAULT_TOOL_RULES: dict[str, str] = {
+    "Read": "allow",
+    "Edit": "ask",
+    "Write": "ask",
+    "Bash": "ask",
+    "WebFetch": "allow",
+    "Grep": "allow",
+}
+
+
+def default_tool_rules() -> dict[str, str]:
+    """Return a fresh copy of the default tool rules."""
+    return dict(DEFAULT_TOOL_RULES)
+
 
 @dataclass
 class PendingPermission:
@@ -135,6 +219,7 @@ class Session:
         allowed_tools: Optional[list[str]] = None,
         disallowed_tools: Optional[list[str]] = None,
         mcp_servers: Optional[dict[str, Any]] = None,
+        tool_rules: Optional[dict[str, str]] = None,
         max_turns: Optional[int] = None,
         include_partial_messages: bool = True,
     ) -> None:
@@ -152,6 +237,22 @@ class Session:
         self.created_at = time.time()
         self.status: str = "idle"
 
+        # Queues for interleaving SDK events with permission events
+        self._permission_events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._sdk_message_queue: asyncio.Queue[Any] = asyncio.Queue()
+        self._reader_task: Optional[asyncio.Task] = None
+        self._turn_complete = asyncio.Event()
+
+        self._client: Optional[ClaudeSDKClient] = None
+        self._pending_permissions: dict[str, PendingPermission] = {}
+        # tool_name (lowercase) -> "allow" | "ask" | "deny". Seeded with
+        # the canonical defaults so the server and UI agree on state
+        # before the user touches anything.
+        self._tool_rules = {k.lower(): v for k, v in DEFAULT_TOOL_RULES.items()}
+        if tool_rules:
+            for k, v in tool_rules.items():
+                self._tool_rules[k.lower()] = v
+
         # Initialize SDK options
         self._options = ClaudeAgentOptions(
             cwd=self.cwd,
@@ -159,13 +260,10 @@ class Session:
             system_prompt=self.system_prompt,
             permission_mode=self.permission_mode,
             max_turns=self.max_turns,
-            allowed_tools=self.allowed_tools or [],
-            disallowed_tools=self.disallowed_tools or [],
+            allowed_tools=self._preapproved_tools(),
+            disallowed_tools=self._disallowed_tools(),
+            can_use_tool=self._can_use_tool,
         )
-
-        self._client: Optional[ClaudeSDKClient] = None
-        self._pending_permissions: dict[str, PendingPermission] = {}
-        self._tool_rules: dict[str, str] = {}  # tool_name -> "allow" | "ask" | "deny"
 
     async def connect(self) -> None:
         """Establish the underlying SDK connection."""
@@ -180,6 +278,13 @@ class Session:
         if self._client is not None:
             logger.info(f"Closing session {self.session_id}...")
             try:
+                # Cancel the reader task first
+                if self._reader_task and not self._reader_task.done():
+                    self._reader_task.cancel()
+                    try:
+                        await self._reader_task
+                    except asyncio.CancelledError:
+                        pass
                 await self._client.disconnect()
             except Exception as e:  # pragma: no cover
                 logger.error(f"Error disconnecting session {self.session_id}: {e}")
@@ -196,6 +301,12 @@ class Session:
     async def set_permission_mode(self, mode: str) -> None:
         """Change the agent's permission mode mid-session."""
         self.permission_mode = mode
+        if self._options is not None:
+            self._options.permission_mode = mode
+            # Refresh allowed/disallowed tools in case they depend on mode
+            self._options.allowed_tools = self._preapproved_tools()
+            self._options.disallowed_tools = self._disallowed_tools()
+
         if self._client is not None:
             logger.info(f"Setting permission mode to {mode} for session {self.session_id}")
             try:
@@ -214,8 +325,134 @@ class Session:
                 pass
 
     def set_tool_rule(self, tool_name: str, rule: str) -> None:
-        """Set a persistent rule for a specific tool."""
-        self._tool_rules[tool_name] = rule
+        """Set a persistent rule for a specific tool and refresh SDK options."""
+        self._tool_rules[tool_name.lower()] = rule
+        # Re-sync the SDK's allow/deny lists so the harness immediately
+        # reflects the new rule without waiting for a reconnect.
+        if self._options is not None:
+            self._options.allowed_tools = self._preapproved_tools()
+            self._options.disallowed_tools = self._disallowed_tools()
+
+    def get_tool_rules(self) -> dict[str, str]:
+        """Return the current effective tool rules keyed by canonical tool name."""
+        return {name: self._tool_rules.get(name.lower(), "ask") for name in DEFAULT_TOOL_RULES}
+
+    def _preapproved_tools(self) -> list[str]:
+        """Tools the SDK harness can run without consulting _can_use_tool."""
+        explicit = set(self.allowed_tools or [])
+        
+        # Tools explicitly set to 'allow' by the user
+        allowed_rules = {name for name, rule in self._tool_rules.items() if rule == "allow"}
+        
+        # Canonical auto-allow tools, but ONLY if they aren't explicitly set to 'ask' or 'deny'
+        auto_allows = {t.lower() for t in DEFAULT_AUTO_ALLOW_TOOLS}
+        for name, rule in self._tool_rules.items():
+            if rule in ("ask", "deny") and name in auto_allows:
+                auto_allows.remove(name)
+
+        return sorted(explicit | allowed_rules | auto_allows)
+
+    def _disallowed_tools(self) -> list[str]:
+        """Tools the SDK harness must never run without explicit override."""
+        explicit = set(self.disallowed_tools or [])
+        # Tools explicitly set to 'deny' by the user
+        denied_rules = {name for name, rule in self._tool_rules.items() if rule == "deny"}
+        return sorted(explicit | denied_rules)
+
+    async def _can_use_tool(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        context: "ToolPermissionContext",
+    ) -> "PermissionResultAllow | PermissionResultDeny":
+        """
+        SDK callback invoked when a tool needs permission approval.
+        Emits a permission_request event to the UI and blocks until the
+        UI responds via POST /v1/permissions/respond.
+        """
+        logger.info(f"Checking permission for {tool_name} in session {self.session_id}. Mode: {self.permission_mode}")
+
+        # 1. Check global permission modes first
+        if self.permission_mode == "bypassPermissions":
+            return PermissionResultAllow()
+        
+        if self.permission_mode == "plan":
+            # In plan mode, we only allow read-only tools
+            if tool_name.lower() in {t.lower() for t in DEFAULT_AUTO_ALLOW_TOOLS}:
+                return PermissionResultAllow()
+            return PermissionResultDeny(message="Not allowed in plan mode", interrupt=False)
+
+        # 2. Check explicit tool rules (case-insensitive keys)
+        rule = self._tool_rules.get(tool_name.lower())
+        if rule == "allow":
+            return PermissionResultAllow()
+        if rule == "deny":
+            return PermissionResultDeny(message="Denied by tool rule", interrupt=False)
+        
+        # 3. Handle acceptEdits mode
+        if self.permission_mode == "acceptEdits":
+            # Auto-approve edits and common read tools
+            if tool_name.lower() in {"edit", "write", "read", "glob", "grep", "webfetch"}:
+                return PermissionResultAllow()
+
+        # 4. Auto-allow read-only tools if not explicitly set to 'ask'
+        if tool_name.lower() in {t.lower() for t in DEFAULT_AUTO_ALLOW_TOOLS} and rule != "ask":
+            return PermissionResultAllow()
+
+        # 5. Otherwise, prompt the UI
+        request_id = f"perm_{uuid.uuid4().hex[:8]}"
+        pending = PendingPermission(
+            request_id=request_id,
+            tool_name=tool_name,
+            tool_input=tool_input,
+        )
+        self._pending_permissions[request_id] = pending
+
+        # Push a permission_request event to the permission queue
+        display_name = getattr(context, "display_name", None) or tool_name
+        description = getattr(context, "description", None) or ""
+        title = getattr(context, "title", None) or f"Run {tool_name}"
+
+        logger.info(f"Emitting permission request {request_id} for tool {tool_name}")
+        await self._permission_events.put({
+            "type": "permission_request",
+            "request_id": request_id,
+            "tool": tool_name,
+            "tool_input": tool_input,
+            "display_name": display_name,
+            "description": description,
+            "title": title,
+        })
+
+        # Block until the UI responds
+        result = await pending.future
+        logger.info(f"Permission request {request_id} resolved: {result.get('approved')}")
+        if result.get("approved"):
+            return PermissionResultAllow()
+        else:
+            return PermissionResultDeny(
+                message=result.get("message", "Denied by user"),
+                interrupt=False,
+            )
+
+    async def _start_reader(self) -> None:
+        """Per-turn reader: reads SDK messages and feeds them into the queue until turn complete."""
+        try:
+            async for msg in self._client.receive_response():
+                logger.info(f"SDK reader received for session {self.session_id}: {type(msg).__name__ if not IS_MOCK else msg}")
+                await self._sdk_message_queue.put(msg)
+                # Signal turn complete on ResultMessage (real SDK) or message_stop (mock)
+                if IS_MOCK:
+                    if isinstance(msg, dict) and msg.get("type") == "message_stop":
+                        self._turn_complete.set()
+                elif isinstance(msg, ResultMessage):
+                    self._turn_complete.set()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"SDK reader error for session {self.session_id}: {e}")
+        finally:
+            logger.info(f"SDK reader task ending for session {self.session_id}")
 
     def resolve_permission(
         self, request_id: str, approved: bool, always: bool = False, deny_message: str | None = None
@@ -250,45 +487,114 @@ class Session:
 
         self.status = "running"
         logger.info(f"Starting turn for session {self.session_id}. Message: {message}")
+        
+        # Propagate planning mode to the SDK
+        old_mode = self.permission_mode
+        if planning_mode:
+            await self.set_permission_mode("plan")
+
+        # Drain any stale events and reset turn complete flag
+        while not self._sdk_message_queue.empty():
+            self._sdk_message_queue.get_nowait()
+        while not self._permission_events.empty():
+            self._permission_events.get_nowait()
+        self._turn_complete.clear()
+
+        # Start reader task BEFORE calling query() so we don't miss any messages
+        self._reader_task = asyncio.create_task(self._start_reader())
+
+        # Start query task so it doesn't block the event yielding loop
+        query_task = asyncio.create_task(self._client.query(message))
 
         try:
-            # 1. Start the turn
-            assert self._client is not None
-            await self._client.query(message)
+            # Consume events until turn is complete
+            while not self._turn_complete.is_set():
+                # Check for pending permission events first
+                # We use a small sleep if both queues are empty to avoid tight loop
+                if self._permission_events.empty() and self._sdk_message_queue.empty():
+                    await asyncio.sleep(0.01)
+                
+                while not self._permission_events.empty():
+                    perm_event = self._permission_events.get_nowait()
+                    yield perm_event
 
-            # 2. Consume events from the SDK
-            async for msg in self._client.receive_response():
+                try:
+                    # Don't block forever here if there might be permission events
+                    msg = await asyncio.wait_for(
+                        self._sdk_message_queue.get(), timeout=0.1
+                    )
+                except asyncio.TimeoutError:
+                    continue
+
                 logger.info(f"Turn response for session {self.session_id}. Message: {msg}")
-                event = await self._handle_sdk_event(msg)
-                if event:
+                events = self._handle_sdk_event(msg)
+                for event in events:
                     yield event
 
+            # Wait for both tasks to complete
+            await asyncio.gather(self._reader_task, query_task)
+
+            # Drain any remaining events after ResultMessage
+            while not self._permission_events.empty():
+                perm_event = self._permission_events.get_nowait()
+                yield perm_event
+
+            while not self._sdk_message_queue.empty():
+                msg = self._sdk_message_queue.get_nowait()
+                events = self._handle_sdk_event(msg)
+                for event in events:
+                    yield event
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Turn error for session {self.session_id}: {e}")
+            raise e
         finally:
+            if planning_mode:
+                await self.set_permission_mode(old_mode)
             self.status = "idle"
             logger.info(f"Turn complete for session {self.session_id}")
 
-    async def _handle_sdk_event(self, event: Any) -> Optional[dict[str, Any]]:
+    def _handle_sdk_event(self, event: Any) -> list[dict[str, Any]]:
         """
-        Map a raw SDK event into the JSON shape our UI expects.
+        Map a raw SDK event into a list of JSON shapes our UI expects.
+        Returns a list because one AssistantMessage can contain multiple content blocks.
         """
+        results: list[dict[str, Any]] = []
+
         # Handle real SDK objects first
         if not IS_MOCK:
             if isinstance(event, AssistantMessage):
-                text_content = ""
                 for block in event.content:
                     if isinstance(block, TextBlock):
-                        text_content += block.text
+                        if block.text:
+                            results.append({"type": "text", "data": block.text})
                     elif isinstance(block, ThinkingBlock):
-                        # Yield a separate event for thinking blocks if possible,
-                        # but if we are returning a single dict we should prioritize text.
-                        # For now, let's just make sure text shows up.
-                        pass
-                if text_content:
-                    return {"type": "text", "data": text_content}
-                return None
+                        thinking = getattr(block, "thinking", "")
+                        if thinking:
+                            results.append({"type": "thinking", "data": thinking, "done": True})
+                    elif isinstance(block, ToolUseBlock):
+                        results.append({
+                            "type": "tool_use",
+                            "tool_id": block.id,
+                            "name": block.name,
+                            "input": block.input,
+                        })
+                    elif isinstance(block, ToolResultBlock):
+                        is_error = getattr(block, "is_error", False)
+                        content = block.content or ""
+                        if isinstance(content, list):
+                            content = " ".join(str(c) for c in content)
+                        results.append({
+                            "type": "tool_error" if is_error else "tool_result",
+                            "tool_id": block.tool_use_id,
+                            **({"error": str(content)} if is_error else {"output": str(content)}),
+                        })
+                return results
 
             if isinstance(event, ResultMessage):
-                return {
+                return [{
                     "type": "result",
                     "usage": event.usage,
                     "duration_ms": event.duration_ms,
@@ -296,10 +602,26 @@ class Session:
                     "num_turns": event.num_turns,
                     "stop_reason": event.stop_reason,
                     "is_error": event.is_error
-                }
+                }]
 
             if isinstance(event, SystemMessage):
-                return {"type": "system", "subtype": event.subtype, "data": event.data}
+                return [{"type": "system", "subtype": event.subtype, "data": event.data}]
+
+            if isinstance(event, UserMessage):
+                # UserMessage carries ToolResultBlocks after the harness executes tools
+                if hasattr(event, "content") and event.content:
+                    for block in event.content:
+                        if isinstance(block, ToolResultBlock):
+                            is_error = getattr(block, "is_error", False)
+                            content = block.content or ""
+                            if isinstance(content, list):
+                                content = " ".join(str(c) for c in content)
+                            results.append({
+                                "type": "tool_error" if is_error else "tool_result",
+                                "tool_id": block.tool_use_id,
+                                **({"error": str(content)} if is_error else {"output": str(content)}),
+                            })
+                return results
 
         # Handle dict-based events (deltas, or mock events)
         etype = None
@@ -313,32 +635,45 @@ class Session:
             delta_type = delta.get("type") if isinstance(delta, dict) else getattr(delta, "type", None)
             if delta_type == "text_delta":
                 text = delta.get("text", "") if isinstance(delta, dict) else getattr(delta, "text", "")
-                return {"type": "text", "data": text}
+                results.append({"type": "text", "data": text})
             elif delta_type == "thinking_delta":
                 thinking = delta.get("thinking", "") if isinstance(delta, dict) else getattr(delta, "thinking", "")
-                return {"type": "thinking", "data": thinking, "done": False}
+                results.append({"type": "thinking", "data": thinking, "done": False})
 
         elif etype == "content_block_start":
             block = event.get("content_block", {}) if isinstance(event, dict) else getattr(event, "content_block", {})
             block_type = block.get("type") if isinstance(block, dict) else getattr(block, "type", None)
             if block_type == "tool_use":
-                return {
+                results.append({
                     "type": "tool_use",
                     "tool_id": block.get("id") if isinstance(block, dict) else getattr(block, "id", None),
                     "name": block.get("name") if isinstance(block, dict) else getattr(block, "name", None),
                     "input": (block.get("input", {}) or {}) if isinstance(block, dict) else (getattr(block, "input", {}) or {}),
-                }
+                })
             elif block_type == "thinking":
-                return {"type": "thinking", "data": "", "done": False, "start": True}
+                results.append({"type": "thinking", "data": "", "done": False, "start": True})
 
         elif etype == "content_block_stop":
-            return {"type": "thinking", "done": True}
+            results.append({"type": "thinking", "done": True})
 
         elif etype == "message_stop":
-            # This is handled for deltas, but ResultMessage is better for full objects
-            return {"type": "done"}
+            results.append({"type": "done"})
 
-        return None
+        elif etype == "tool_result":
+            results.append({
+                "type": "tool_result",
+                "tool_id": event.get("tool_id"),
+                "output": event.get("output", "")
+            })
+
+        elif etype == "tool_error":
+            results.append({
+                "type": "tool_error",
+                "tool_id": event.get("tool_id"),
+                "error": event.get("error", "")
+            })
+
+        return results
 
 
 def _stringify_tool_content(content: Any) -> str:

@@ -237,6 +237,15 @@ async def async_client_with_db():
     from app.sessions import SessionManager
     import app.main as main
     from app import database as db
+    import tempfile
+    from pathlib import Path
+    import shutil
+
+    tmpdir = tempfile.mkdtemp()
+    tmp = Path(tmpdir) / "test_main.db"
+    old_db_path = db.DB_PATH
+    db.DB_PATH = tmp
+    db._db = None
 
     main.manager = SessionManager()
 
@@ -245,6 +254,9 @@ async def async_client_with_db():
 
     await main.manager.close_all()
     await db.close_db()
+    db.DB_PATH = old_db_path
+    db._db = None
+    shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 @pytest.mark.asyncio

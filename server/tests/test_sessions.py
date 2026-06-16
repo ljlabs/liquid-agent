@@ -41,8 +41,12 @@ async def test_session_with_none_tools():
             disallowed_tools=None
         )
         assert session.session_id == "test_session"
-        # The options should have empty lists instead of None
-        assert session._options.allowed_tools == []
+        # SDK preapproved_tools should include the auto-allow set even
+        # though allowed_tools was passed as None.
+        from app.sessions import DEFAULT_AUTO_ALLOW_TOOLS
+        for tool in DEFAULT_AUTO_ALLOW_TOOLS:
+            assert tool.lower() in session._options.allowed_tools
+        # Disallowed should be empty since no tool is denied by default
         assert session._options.disallowed_tools == []
 
 
@@ -58,8 +62,11 @@ async def test_session_with_tool_lists():
             disallowed_tools=["Bash"]
         )
         assert session.session_id == "test_session"
-        assert session._options.allowed_tools == ["Read", "Write"]
-        assert session._options.disallowed_tools == ["Bash"]
+        # Explicit allows land in preapproved_tools alongside auto-allows
+        assert "Read" in session._options.allowed_tools
+        assert "Write" in session._options.allowed_tools
+        # Explicit deny of Bash becomes part of disallowed_tools
+        assert "bash" in [t.lower() for t in session._options.disallowed_tools]
 
 
 @pytest.mark.asyncio
@@ -167,6 +174,19 @@ def test_default_auto_allow_tools():
 
     expected_tools = {"Read", "Glob", "Grep", "WebFetch", "WebSearch", "TodoWrite"}
     assert DEFAULT_AUTO_ALLOW_TOOLS == expected_tools
+
+
+def test_default_tool_rules_populated():
+    """Test that DEFAULT_TOOL_RULES has entries for the canonical tool list."""
+    from app.sessions import DEFAULT_TOOL_RULES
+
+    assert "Bash" in DEFAULT_TOOL_RULES
+    assert DEFAULT_TOOL_RULES["Bash"] == "ask"
+    assert DEFAULT_TOOL_RULES["Read"] == "allow"
+    assert DEFAULT_TOOL_RULES["Edit"] == "ask"
+    assert DEFAULT_TOOL_RULES["Write"] == "ask"
+    assert DEFAULT_TOOL_RULES["WebFetch"] == "allow"
+    assert DEFAULT_TOOL_RULES["Grep"] == "allow"
 
 
 # ------------------------------------------------------------------

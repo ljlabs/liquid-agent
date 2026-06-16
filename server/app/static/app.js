@@ -13,24 +13,45 @@ async function dbFetch(path, opts = {}) {
   return res.json();
 }
 
-// ---------- collapsible sidebar sections ----------
-document.querySelectorAll('[data-toggle]').forEach(el => {
-  el.addEventListener('click', () => el.parentElement.classList.toggle('collapsed'));
-});
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
 
-// ---------- tool block collapse ----------
-document.querySelectorAll('[data-toggle-tool]').forEach(header => {
-  header.addEventListener('click', () => {
-    const body = header.nextElementSibling;
-    const chev = header.querySelector('.chev');
+// ---------- delegated toggle clicks ----------
+// Consolidates sidebar, tool block, thinking block, and tool output toggles
+document.addEventListener('click', (e) => {
+  // Sidebar section toggle
+  const sidebarToggle = e.target.closest('[data-toggle]');
+  if (sidebarToggle) {
+    sidebarToggle.parentElement.classList.toggle('collapsed');
+    return;
+  }
+
+  // Tool block toggle
+  const toolToggle = e.target.closest('[data-toggle-tool]');
+  if (toolToggle) {
+    const body = toolToggle.nextElementSibling;
+    const chev = toolToggle.querySelector('.chev');
     body.classList.toggle('hidden');
     chev.classList.toggle('open');
-  });
-});
+    return;
+  }
 
-// ---------- thinking block collapse ----------
-document.querySelectorAll('[data-toggle-think]').forEach(block => {
-  block.addEventListener('click', () => block.classList.toggle('collapsed'));
+  // Thinking block toggle
+  const thinkToggle = e.target.closest('[data-toggle-think]');
+  if (thinkToggle) {
+    thinkToggle.classList.toggle('collapsed');
+    return;
+  }
+
+  // Tool output toggle
+  const outToggle = e.target.closest('.tool-output-header');
+  if (outToggle) {
+    const outBody = outToggle.nextElementSibling;
+    outBody.classList.toggle('hidden');
+    outToggle.querySelector('.chev').classList.toggle('open');
+    return;
+  }
 });
 
 // ---------- session list from DB ----------
@@ -69,17 +90,50 @@ async function switchToSession(sessionId, title, clickedItem) {
   document.getElementById('session-title').textContent = title || 'Session';
   document.getElementById('conversation').innerHTML = '';
 
+  await loadSessionToolRules(sessionId);
+
   try {
     const data = await dbFetch(`/v1/db/sessions/${sessionId}/messages`);
+    let currentAssistantEl = null;
+
     for (const msg of data.messages) {
       if (msg.role === 'user') {
+        currentAssistantEl = null;
         appendUserMessage(msg.content);
-      } else if (msg.role === 'assistant' && msg.type === 'text') {
-        appendAssistantMessage(msg.content);
-      } else if (msg.role === 'assistant' && msg.type === 'thinking') {
-        // Could render thinking blocks — skip for now, it's historical
-      } else if (msg.type === 'tool_use') {
-        // Could render tool blocks — skip for now
+      } else {
+        if (!currentAssistantEl) {
+          currentAssistantEl = appendAssistantStub();
+          currentAssistantEl.querySelector('.cursor-blink')?.remove();
+          currentAssistantEl.querySelector('.msg-content')?.remove();
+        }
+        const bodyEl = currentAssistantEl.querySelector('.msg-body');
+
+        if (msg.type === 'text' && msg.content) {
+          const contentEl = document.createElement('div');
+          contentEl.className = 'msg-content markdown-body rendered';
+          contentEl.innerHTML = marked.parse(msg.content);
+          bodyEl.appendChild(contentEl);
+        } else if (msg.type === 'thinking' && msg.content) {
+          appendOrUpdateThinking(currentAssistantEl, { data: msg.content, done: true });
+        } else if (msg.type === 'tool_use') {
+          let input = {};
+          try { input = JSON.parse(msg.tool_input || '{}'); } catch (_) {}
+          appendToolBlock(bodyEl, {
+            id: msg.tool_id || `hist_${msg.id}`,
+            name: msg.tool_name || 'Tool',
+            target: String(input.path || input.command || '').slice(0, 60),
+            status: 'running',
+            input,
+          });
+        } else if (msg.type === 'tool_result' || msg.type === 'tool_error') {
+          const toolBlock = bodyEl.querySelector(`[data-tool-id="${msg.tool_id}"]`);
+          if (toolBlock) {
+            updateToolBlock(toolBlock, {
+              status: msg.type === 'tool_error' ? 'error' : 'success',
+              output: msg.content,
+            });
+          }
+        }
       }
     }
   } catch (e) {
@@ -88,9 +142,8 @@ async function switchToSession(sessionId, title, clickedItem) {
 }
 
 // ---------- new session ----------
-document.getElementById('new-session').addEventListener('click', async () => {
+async function createNewSession() {
   try {
-    // Call API to create session eagerly in SDK and DB
     const data = await dbFetch('/v1/sessions', {
       method: 'POST',
       body: JSON.stringify({
@@ -101,30 +154,26 @@ document.getElementById('new-session').addEventListener('click', async () => {
 
     const sessionId = data.session_id;
 
-    // Update UI state
     activeSessionId = sessionId;
     document.getElementById('session-id-tag').textContent = sessionId;
     document.getElementById('turn-tag').textContent = 'Turn 0';
     document.getElementById('conversation').innerHTML = '';
     document.getElementById('prompt-input').focus();
 
-    // Refresh the sidebar list to show the newly created session
+    await loadSessionToolRules(sessionId);
     await loadSessionList();
 
-    // Mark the new session as active in the list
     document.querySelectorAll('.session-item').forEach(item => {
-      if (item.dataset.session === sessionId) {
-        item.classList.add('active');
-      } else {
-        item.classList.remove('active');
-      }
+      item.classList.toggle('active', item.dataset.session === sessionId);
     });
 
   } catch (e) {
     console.error('Failed to create new session:', e);
     alert('Failed to create session. Please check server connection.');
   }
-});
+}
+
+document.getElementById('new-session').addEventListener('click', createNewSession);
 
 // ---------- right panel tabs ----------
 document.querySelectorAll('.rp-tab').forEach(tab => {
@@ -224,29 +273,22 @@ function appendAssistantMessage(text) {
   scrollToBottom();
 }
 
-function renderAssistantContent(msgEl, fullText) {
-  const contentEl = msgEl.querySelector('.msg-content');
-  const bodyEl = msgEl.querySelector('.msg-body');
-  
-  // Extract <thought> tags
+function processThoughts(msgEl, text) {
   const thoughtRegex = /<thought>([\s\S]*?)<\/thought>/g;
-  let text = fullText;
+  let renderText = text;
   let match;
-  
-  // Clear existing content except metadata
-  contentEl.innerHTML = '';
-
-  while ((match = thoughtRegex.exec(fullText)) !== null) {
-    const thoughtContent = match[1];
-    appendOrUpdateThinking(msgEl, { data: thoughtContent, done: true });
-    text = text.replace(match[0], '');
+  while ((match = thoughtRegex.exec(text)) !== null) {
+    appendOrUpdateThinking(msgEl, { data: match[1], done: true });
+    renderText = renderText.replace(match[0], '');
   }
-
-  contentEl.innerHTML = marked.parse(text.trim());
+  return renderText.trim();
 }
 
-function escapeHtml(s) {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+function renderAssistantContent(msgEl, fullText) {
+  const contentEl = msgEl.querySelector('.msg-content');
+  contentEl.innerHTML = '';
+  const cleanText = processThoughts(msgEl, fullText);
+  contentEl.innerHTML = marked.parse(cleanText);
 }
 
 function setStreaming(on) {
@@ -292,7 +334,7 @@ async function handleSend() {
   input.style.height = 'auto';
   charCount.textContent = '0';
 
-  const endpoint = document.getElementById('endpoint-input').value;
+  const endpoint = getEndpoint();
   const model = document.getElementById('model-select').value;
   const mode = modeState.current;
 
@@ -304,6 +346,8 @@ async function sendToWrapper(endpoint, model, userMessage, options = {}) {
   const msgEl = appendAssistantStub();
   const contentEl = msgEl.querySelector('.msg-content');
   setStreaming(true);
+
+  console.log('[sendToWrapper] Starting stream request', { endpoint, model, planning_mode: options.planning });
 
   try {
     const response = await fetch(`${endpoint}/v1/sessions/stream`, {
@@ -319,6 +363,8 @@ async function sendToWrapper(endpoint, model, userMessage, options = {}) {
       signal: currentStreamAbortController.signal
     });
 
+    console.log('[sendToWrapper] Stream response status:', response.status);
+
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
     }
@@ -326,10 +372,14 @@ async function sendToWrapper(endpoint, model, userMessage, options = {}) {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    let eventCount = 0;
 
     while (true) {
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done) {
+        console.log('[sendToWrapper] Stream complete, received', eventCount, 'events');
+        break;
+      }
 
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
@@ -340,15 +390,17 @@ async function sendToWrapper(endpoint, model, userMessage, options = {}) {
 
         try {
           const event = JSON.parse(line.slice(6));
+          eventCount++;
           handleStreamEvent(event, msgEl);
         } catch (e) {
-          console.error('Failed to parse event:', e);
+          console.error('Failed to parse event:', e, 'line:', line);
         }
       }
     }
 
     setStreaming(false);
   } catch (err) {
+    console.error('[sendToWrapper] Error:', err);
     if (err.name !== 'AbortError') {
       contentEl.innerHTML += `<div style="color:var(--err); margin-top:4px;">Error: ${escapeHtml(err.message)}</div>`;
     }
@@ -359,6 +411,8 @@ async function sendToWrapper(endpoint, model, userMessage, options = {}) {
 function handleStreamEvent(event, msgEl) {
   const contentEl = msgEl.querySelector('.msg-content');
   const bodyEl = msgEl.querySelector('.msg-body');
+
+  console.log('[SSE event]', event.type, event);
 
   switch (event.type) {
     case 'session':
@@ -371,24 +425,37 @@ function handleStreamEvent(event, msgEl) {
         document.getElementById('cwd-input').value = event.cwd;
         document.getElementById('cwd-display').textContent = event.cwd;
       }
-      // Refresh sidebar to show new session
       loadSessionList();
+      loadSessionToolRules(event.session_id);
       break;
 
     case 'text':
-      // Store full accumulated text in a data attribute to re-render properly
-      let currentText = msgEl.dataset.fullText || '';
-      currentText += event.data;
-      msgEl.dataset.fullText = currentText;
+      let activeTextEl = bodyEl.querySelector('.msg-content.streaming-active');
+      if (!activeTextEl) {
+        const initialTextEl = bodyEl.querySelector('.msg-content');
+        if (initialTextEl && !initialTextEl.classList.contains('rendered')) {
+          activeTextEl = initialTextEl;
+          activeTextEl.classList.add('streaming-active');
+        } else {
+          activeTextEl = document.createElement('div');
+          activeTextEl.className = 'msg-content markdown-body streaming-active';
+          bodyEl.appendChild(activeTextEl);
+        }
+      }
 
-      renderAssistantContent(msgEl, currentText);
+      let textVal = activeTextEl.dataset.fullText || '';
+      textVal += event.data;
+      activeTextEl.dataset.fullText = textVal;
+
+      const renderText = processThoughts(msgEl, textVal);
+      activeTextEl.innerHTML = marked.parse(renderText);
+
       // Keep cursor if not done
-      if (!currentText.includes('</thought>') || currentText.split('</thought>').pop().trim() !== '') {
-         const contentEl = msgEl.querySelector('.msg-content');
-         if (!contentEl.querySelector('.cursor-blink')) {
+      if (!textVal.includes('</thought>') || textVal.split('</thought>').pop().trim() !== '') {
+         if (!activeTextEl.querySelector('.cursor-blink')) {
            const span = document.createElement('span');
            span.className = 'cursor-blink';
-           contentEl.appendChild(span);
+           activeTextEl.appendChild(span);
          }
       }
       scrollToBottom();
@@ -400,6 +467,12 @@ function handleStreamEvent(event, msgEl) {
       break;
 
     case 'tool_use':
+      const currentActiveText = bodyEl.querySelector('.msg-content.streaming-active');
+      if (currentActiveText) {
+        currentActiveText.classList.remove('streaming-active');
+        currentActiveText.classList.add('rendered');
+        currentActiveText.querySelector('.cursor-blink')?.remove();
+      }
       appendToolBlock(bodyEl, {
         id: event.tool_id || Math.random().toString(36),
         name: event.name,
@@ -442,7 +515,8 @@ function handleStreamEvent(event, msgEl) {
     case 'planning_complete':
       if (modeState.current === 'plan') {
         setAwaitingApproval(true);
-        appendPlanningApprovalCard(bodyEl, event.plan || contentEl.textContent);
+        const fullTxt = Array.from(bodyEl.querySelectorAll('.msg-content')).map(el => el.textContent).join('\n');
+        appendPlanningApprovalCard(bodyEl, event.plan || fullTxt);
       }
       scrollToBottom();
       break;
@@ -457,13 +531,18 @@ function handleStreamEvent(event, msgEl) {
       break;
 
     case 'error':
-      contentEl.innerHTML += `<div style="color:var(--err); margin-top:4px;">Error: ${escapeHtml(event.message)}</div>`;
+      const errEl = bodyEl.querySelector('.msg-content.streaming-active') || bodyEl.querySelector('.msg-content') || bodyEl;
+      errEl.innerHTML += `<div style="color:var(--err); margin-top:4px;">Error: ${escapeHtml(event.message)}</div>`;
       scrollToBottom();
       break;
 
     case 'done':
-      const cursor = contentEl.querySelector('.cursor-blink');
-      if (cursor) cursor.remove();
+      const activeTextFinished = bodyEl.querySelector('.msg-content.streaming-active');
+      if (activeTextFinished) {
+        activeTextFinished.classList.remove('streaming-active');
+        activeTextFinished.classList.add('rendered');
+      }
+      msgEl.querySelectorAll('.cursor-blink').forEach(c => c.remove());
       break;
   }
 }
@@ -480,7 +559,6 @@ function appendOrUpdateThinking(msgEl, event) {
         Thinking
       </div>
       <div class="tbody"></div>`;
-    block.addEventListener('click', () => block.classList.toggle('collapsed'));
     const contentEl = msgEl.querySelector('.msg-content');
     contentEl.before(block);
   }
@@ -556,8 +634,7 @@ function appendPermissionCard(bodyEl, event) {
       card.style.opacity = '0.6';
       card.querySelectorAll('.pbtn').forEach(b => b.disabled = true);
 
-      const endpoint = document.getElementById('endpoint-input').value;
-      await sendApprovalResponse(endpoint, event.request_id, action);
+      await sendApprovalResponse(event.request_id, action);
 
       const result = document.createElement('div');
       result.style.cssText = 'font-size:11px;color:var(--ok);margin-top:6px;';
@@ -606,11 +683,10 @@ function appendPlanningApprovalCard(bodyEl, plan) {
   bodyEl.appendChild(card);
 }
 
-async function sendApprovalResponse(endpoint, requestId, action) {
+async function sendApprovalResponse(requestId, action) {
   try {
-    await fetch(`${endpoint}/v1/permissions/respond`, {
+    await dbFetch('/v1/permissions/respond', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         request_id: requestId,
         approved: action !== 'deny',
@@ -640,14 +716,6 @@ function appendToolBlock(bodyEl, toolData) {
     </div>
   `;
 
-  const header = block.querySelector('[data-toggle-tool]');
-  header.addEventListener('click', () => {
-    const body = header.nextElementSibling;
-    const chev = header.querySelector('.chev');
-    body.classList.toggle('hidden');
-    chev.classList.toggle('open');
-  });
-
   bodyEl.appendChild(block);
   return block;
 }
@@ -658,16 +726,53 @@ function updateToolBlock(block, updates) {
     badge.className = 'tool-status ' + updates.status;
     badge.textContent = updates.status;
   }
-  if (updates.output) {
+  if (updates.output !== undefined && updates.output !== null) {
     const body = block.querySelector('.tool-body');
-    if (!body.querySelector('.label:nth-of-type(2)')) {
-      const label = document.createElement('div');
-      label.className = 'label';
-      label.textContent = updates.status === 'error' ? 'Error' : 'Output';
+    if (!body.querySelector('.tool-output-section')) {
+      const outputText = typeof updates.output === 'string'
+        ? updates.output
+        : JSON.stringify(updates.output, null, 2);
+      const TRUNCATE = 500;
+      const isTruncated = outputText.length > TRUNCATE;
+      const truncated = isTruncated ? outputText.slice(0, TRUNCATE) : outputText;
+
+      const section = document.createElement('div');
+      section.className = 'tool-output-section';
+
+      const outHeader = document.createElement('div');
+      outHeader.className = 'tool-output-header';
+      outHeader.innerHTML = `
+        <svg class="chev" width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 3l5 5-5 5"/></svg>
+        <span>${updates.status === 'error' ? 'Error' : 'Output'}</span>
+      `;
+
+      const outBody = document.createElement('div');
+      outBody.className = 'tool-output-body hidden';
+
       const pre = document.createElement('pre');
-      pre.textContent = typeof updates.output === 'string' ? updates.output : JSON.stringify(updates.output, null, 2);
-      body.appendChild(label);
-      body.appendChild(pre);
+      pre.className = 'tool-output-pre';
+      pre.textContent = truncated;
+      outBody.appendChild(pre);
+
+      if (isTruncated) {
+        const expandBtn = document.createElement('button');
+        expandBtn.className = 'tool-output-expand';
+        expandBtn.textContent = `Show full output (${outputText.length} chars)`;
+        let expanded = false;
+        expandBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          expanded = !expanded;
+          pre.textContent = expanded ? outputText : truncated;
+          expandBtn.textContent = expanded
+            ? 'Collapse output'
+            : `Show full output (${outputText.length} chars)`;
+        });
+        outBody.appendChild(expandBtn);
+      }
+
+      section.appendChild(outHeader);
+      section.appendChild(outBody);
+      body.appendChild(section);
     }
   }
 }
@@ -690,44 +795,89 @@ const maxTurnsVal = document.getElementById('max-turns-val');
 maxTurns.addEventListener('input', () => maxTurnsVal.textContent = maxTurns.value);
 
 // ---------- permission badge cycling ----------
-document.querySelectorAll('#tool-perm-list .tool-perm').forEach(row => {
-  const badge = row.querySelector('.perm-badge');
-  const states = ['allow', 'ask', 'deny'];
-  badge.addEventListener('click', async () => {
-    let cur = states.indexOf(badge.classList[1]);
-    badge.classList.remove(states[cur]);
-    cur = (cur + 1) % states.length;
-    badge.classList.add(states[cur]);
-    badge.textContent = states[cur];
+let toolPermHandlers = [];
 
-    if (!activeSessionId) return;
-    const endpoint = document.getElementById('endpoint-input').value;
-    try {
-      await fetch(`${endpoint}/v1/sessions/${activeSessionId}/tool-rule`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          session_id: activeSessionId,
-          tool_name: row.dataset.tool,
-          rule: states[cur]
-        })
-      });
-      addLogLine('info', `tool rule updated: ${row.dataset.tool} → ${states[cur]}`);
-    } catch (e) {
-      addLogLine('error', `failed to update tool rule: ${e.message}`);
-    }
+function renderToolPerms(tools) {
+  const list = document.getElementById('tool-perm-list');
+  if (!list) return;
+
+  toolPermHandlers.forEach(({ row, handler }) => {
+    const badge = row.querySelector('.perm-badge');
+    if (badge) badge.removeEventListener('click', handler);
   });
-});
+  toolPermHandlers = [];
+
+  list.innerHTML = '';
+  for (const { tool, rule } of tools) {
+    const row = document.createElement('div');
+    row.className = 'tool-perm';
+    row.dataset.tool = tool;
+    row.innerHTML = `<span class="name">${escapeHtml(tool)}</span><span class="perm-badge ${rule}">${rule}</span>`;
+    list.appendChild(row);
+  }
+
+  list.querySelectorAll('.tool-perm').forEach(row => {
+    const badge = row.querySelector('.perm-badge');
+    const handler = async () => {
+      const states = ['allow', 'ask', 'deny'];
+      let cur = states.indexOf(badge.classList[1]);
+      badge.classList.remove(states[cur]);
+      cur = (cur + 1) % states.length;
+      badge.classList.add(states[cur]);
+      badge.textContent = states[cur];
+
+      if (!activeSessionId) {
+        addLogLine('warn', `tool rule for ${row.dataset.tool} updated locally only (no active session)`);
+        return;
+      }
+      try {
+        await dbFetch(`/v1/sessions/${activeSessionId}/tool-rule`, {
+          method: 'POST',
+          body: JSON.stringify({
+            session_id: activeSessionId,
+            tool_name: row.dataset.tool,
+            rule: states[cur]
+          })
+        });
+        addLogLine('info', `tool rule updated: ${row.dataset.tool} → ${states[cur]}`);
+      } catch (e) {
+        addLogLine('error', `failed to update tool rule: ${e.message}`);
+      }
+    };
+    badge.addEventListener('click', handler);
+    toolPermHandlers.push({ row, handler });
+  });
+}
+
+async function loadToolDefaults() {
+  try {
+    const data = await dbFetch('/v1/tool-defaults');
+    renderToolPerms(data.tools.map(tool => ({
+      tool,
+      rule: data.rules.find(r => r.tool === tool)?.rule || 'ask',
+    })));
+  } catch (e) {
+    console.error('Failed to load tool defaults:', e);
+  }
+}
+
+async function loadSessionToolRules(sessionId) {
+  try {
+    const data = await dbFetch(`/v1/sessions/${sessionId}/tool-rules`);
+    renderToolPerms(data.rules);
+  } catch (e) {
+    console.warn('No session rules, using defaults:', e);
+    await loadToolDefaults();
+  }
+}
 
 // ---------- permission mode select ----------
 document.getElementById('perm-mode-select').addEventListener('change', async (e) => {
   const mode = e.target.value;
   if (!activeSessionId) return;
-  const endpoint = document.getElementById('endpoint-input').value;
   try {
-    await fetch(`${endpoint}/v1/sessions/${activeSessionId}/permission-mode`, {
+    await dbFetch(`/v1/sessions/${activeSessionId}/permission-mode`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ session_id: activeSessionId, permission_mode: mode })
     });
     addLogLine('info', `permission mode → ${mode}`);
@@ -740,11 +890,9 @@ document.getElementById('perm-mode-select').addEventListener('change', async (e)
 document.getElementById('model-select').addEventListener('change', async (e) => {
   const model = e.target.value;
   if (!activeSessionId) return;
-  const endpoint = document.getElementById('endpoint-input').value;
   try {
-    await fetch(`${endpoint}/v1/sessions/${activeSessionId}/model`, {
+    await dbFetch(`/v1/sessions/${activeSessionId}/model`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ session_id: activeSessionId, model })
     });
     addLogLine('info', `model → ${model}`);
@@ -758,5 +906,8 @@ document.getElementById('mobile-toggle').addEventListener('click', () => {
   document.getElementById('sidebar').classList.toggle('open');
 });
 
-// ---------- init: load persisted sessions on page load ----------
-window.addEventListener('DOMContentLoaded', loadSessionList);
+// ---------- init: load persisted sessions and tool defaults on page load ----------
+window.addEventListener('DOMContentLoaded', () => {
+  loadSessionList();
+  loadToolDefaults();
+});

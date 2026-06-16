@@ -126,3 +126,15 @@ class DBMessageInfo(BaseModel):
 
 class DBMessageListResponse(BaseModel):
     messages: list[DBMessageInfo]
+
+
+class ToolRuleInfo(BaseModel):
+    """A single tool's rule, surfaced via /v1/tool-defaults and session views."""
+    tool: str
+    rule: Literal["allow", "ask", "deny"]
+
+
+class ToolDefaultsResponse(BaseModel):
+    """Canonical tool list and per-session effective rules."""
+    tools: list[str]
+    rules: list[ToolRuleInfo]
