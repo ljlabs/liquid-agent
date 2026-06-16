@@ -52,7 +52,7 @@ export async function sendToWrapper(endpoint, model, userMessage, options = {}) 
         session_id: state.activeSessionId,
         model,
         planning_mode: options.planning || false,
-        auto_approve: state.modeState.current === 'accept'
+        auto_approve: state.modeState.current === 'acceptEdits'
       }),
       signal: state.currentStreamAbortController.signal
     });

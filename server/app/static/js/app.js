@@ -51,18 +51,34 @@ document.querySelectorAll('.rp-tab').forEach(tab => {
 // ---------- mode pill cycle ----------
 const modes = [
   { cls: 'active-plan', label: 'Plan mode', icon: '<path d="M3 3h10v10H3z"/><path d="M3 6.5h10M6.5 3v10"/>', state: 'plan' },
-  { cls: 'active-accept', label: 'Auto-accept edits', icon: '<path d="M3 8l3 3 7-7"/>', state: 'accept' },
+  { cls: 'active-accept', label: 'Auto-accept edits', icon: '<path d="M3 8l3 3 7-7"/>', state: 'acceptEdits' },
   { cls: '', label: 'Default mode', icon: '<circle cx="8" cy="8" r="5"/>', state: 'default' }
 ];
 
 const modePill = document.getElementById('mode-pill');
-modePill.addEventListener('click', () => {
+modePill.addEventListener('click', async () => {
   state.modeIdx = (state.modeIdx + 1) % modes.length;
   const m = modes[state.modeIdx];
   state.modeState.current = m.state;
   modePill.className = 'mode-pill ' + m.cls;
   modePill.querySelector('svg').innerHTML = m.icon;
   modePill.childNodes[modePill.childNodes.length - 1].textContent = ' ' + m.label;
+
+  // Sync with server if there's an active session
+  if (state.activeSessionId) {
+    try {
+      await dbFetch(`/v1/sessions/${state.activeSessionId}/permission-mode`, {
+        method: 'POST',
+        body: JSON.stringify({ session_id: state.activeSessionId, permission_mode: m.state })
+      });
+      // Also update the dropdown if it exists to keep UI in sync
+      const select = document.getElementById('perm-mode-select');
+      if (select) select.value = m.state;
+      addLogLine('info', `permission mode → ${m.state}`);
+    } catch (err) {
+      addLogLine('error', `failed to sync permission mode: ${err.message}`);
+    }
+  }
 });
 
 // ---------- textarea autosize + char count ----------
