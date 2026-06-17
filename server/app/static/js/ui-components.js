@@ -1,5 +1,5 @@
 import { escapeHtml, scrollToBottom } from './utils.js';
-import { sendApprovalResponse } from './api.js';
+import { sendAction } from './stream.js';
 import { state } from './state.js';
 
 export function appendUserMessage(text) {
@@ -55,6 +55,9 @@ export function appendToolBlock(bodyEl, toolData) {
   const block = document.createElement('div');
   block.className = 'tool-block';
   block.dataset.toolId = toolData.id;
+  if (toolData.pendingRequestId) {
+    block.dataset.pendingRequestId = toolData.pendingRequestId;
+  }
   block.innerHTML = `
     <div class="tool-header" data-toggle-tool>
       <svg class="chev open" width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 3l5 5-5 5"/></svg>
@@ -152,14 +155,28 @@ export function appendPermissionCard(bodyEl, event, onRespond) {
       card.style.opacity = '0.6';
       card.querySelectorAll('.pbtn').forEach(b => b.disabled = true);
 
-      await sendApprovalResponse(event.request_id, action);
+      await sendAction({
+        action: 'respond_permission',
+        session_id: state.activeSessionId,
+        request_id: event.request_id,
+        approved: action !== 'deny',
+        always: action === 'allowAll',
+      });
 
       const result = document.createElement('div');
-      result.style.cssText = 'font-size:11px;color:var(--ok);margin-top:6px;';
+      const isAllowed = action !== 'deny';
+      result.style.cssText = `font-size:11px;color:${isAllowed ? 'var(--ok)' : 'var(--err)'};margin-top:6px;`;
       result.textContent = `→ ${btn.textContent}`;
       card.appendChild(result);
 
-      // Hide the card after a short delay
+      const toolBlock = bodyEl.querySelector(`[data-pending-request-id="${event.request_id}"]`);
+      if (toolBlock) {
+        updateToolBlock(toolBlock, {
+          status: isAllowed ? 'approved' : 'denied',
+        });
+        toolBlock.removeAttribute('data-pending-request-id');
+      }
+
       setTimeout(() => {
         card.style.display = 'none';
       }, 1000);

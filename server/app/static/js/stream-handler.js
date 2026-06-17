@@ -173,8 +173,9 @@ export function handleStreamEvent(event, msgEl) {
         name: event.name,
         target: (event.input && (event.input.path || event.input.command))
           || (event.input && Object.keys(event.input).length ? JSON.stringify(event.input).slice(0, 60) : ''),
-        status: 'running',
-        input: event.input || {}
+        status: event.pending_request_id ? 'pending_approval' : 'running',
+        input: event.input || {},
+        pendingRequestId: event.pending_request_id || null,
       });
       scrollToBottom();
       break;
@@ -202,8 +203,12 @@ export function handleStreamEvent(event, msgEl) {
       break;
 
     case 'permission_request':
+      state.pendingPermissions.push(event);
       setAwaitingApproval(true);
-      appendPermissionCard(bodyEl, event, () => setAwaitingApproval(false));
+      appendPermissionCard(bodyEl, event, () => {
+        setAwaitingApproval(false);
+        state.pendingPermissions = state.pendingPermissions.filter(p => p.request_id !== event.request_id);
+      });
       scrollToBottom();
       break;
 
@@ -268,5 +273,51 @@ function finalizeAssistantMessage(msgEl, result) {
 
   if (result.num_turns != null) {
     document.getElementById('turn-tag').textContent = `Turn ${result.num_turns}`;
+  }
+}
+
+export async function subscribeToSessionEvents(sessionId) {
+  if (state.streaming) return;
+
+  const endpoint = getEndpoint();
+  const conversation = document.getElementById('conversation');
+  let msgEl = conversation.querySelector('.msg.assistant:last-of-type');
+  if (!msgEl) {
+    msgEl = appendAssistantStub();
+  }
+  const bodyEl = msgEl.querySelector('.msg-body');
+  setStreaming(true);
+
+  try {
+    const response = await fetch(`${endpoint}/v1/sessions/${sessionId}/events`);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const event = JSON.parse(line.slice(6));
+          if (event.type === 'heartbeat') continue;
+          handleStreamEvent(event, msgEl);
+        } catch (e) {
+          console.error('Failed to parse event:', e);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[subscribeToSessionEvents] Error:', err);
+  } finally {
+    setStreaming(false);
   }
 }

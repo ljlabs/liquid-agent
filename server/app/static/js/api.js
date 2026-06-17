@@ -10,9 +10,9 @@ export async function dbFetch(path, opts = {}) {
   return res.json();
 }
 
-export async function sendApprovalResponse(requestId, action) {
+export async function sendApprovalResponse(requestId, action, sessionId) {
   try {
-    await dbFetch('/v1/permissions/respond', {
+    await dbFetch(`/v1/sessions/${sessionId}/permissions/respond`, {
       method: 'POST',
       body: JSON.stringify({
         request_id: requestId,
@@ -22,5 +22,15 @@ export async function sendApprovalResponse(requestId, action) {
     });
   } catch (err) {
     console.error('Failed to send approval:', err);
+  }
+}
+
+export async function fetchPendingPermissions(sessionId) {
+  try {
+    const data = await dbFetch(`/v1/sessions/${sessionId}/pending-permissions`);
+    return data.permissions || [];
+  } catch (err) {
+    console.error('Failed to fetch pending permissions:', err);
+    return [];
   }
 }

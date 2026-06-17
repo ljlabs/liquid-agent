@@ -60,6 +60,7 @@ async def _init_schema(db: aiosqlite.Connection) -> None:
             tool_name   TEXT,
             tool_id     TEXT,
             tool_input  TEXT,
+            pending_request_id TEXT,
             created_at  REAL NOT NULL
         );
 
@@ -74,8 +75,19 @@ async def _init_schema(db: aiosqlite.Connection) -> None:
             created_at  REAL NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS pending_permissions (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            request_id  TEXT NOT NULL,
+            tool_name   TEXT NOT NULL,
+            tool_id     TEXT,
+            tool_input  TEXT,
+            created_at  REAL NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
         CREATE INDEX IF NOT EXISTS idx_permissions_session ON permissions(session_id, id);
+        CREATE INDEX IF NOT EXISTS idx_pending_permissions_session ON pending_permissions(session_id);
     """)
     # Backwards-compat: add tool_rules JSON column if it doesn't already
     # exist. Older databases (created before this column shipped) get the
@@ -85,6 +97,16 @@ async def _init_schema(db: aiosqlite.Connection) -> None:
     cols = {row["name"] for row in await cursor.fetchall()}
     if "tool_rules" not in cols:
         await db.execute("ALTER TABLE sessions ADD COLUMN tool_rules TEXT NOT NULL DEFAULT ''")
+    # Backwards-compat: add pending_request_id column to messages if missing
+    cursor = await db.execute("PRAGMA table_info(messages)")
+    msg_cols = {row["name"] for row in await cursor.fetchall()}
+    if "pending_request_id" not in msg_cols:
+        await db.execute("ALTER TABLE messages ADD COLUMN pending_request_id TEXT")
+    # Backwards-compat: add tool_id column to pending_permissions if missing
+    cursor = await db.execute("PRAGMA table_info(pending_permissions)")
+    perm_cols = {row["name"] for row in await cursor.fetchall()}
+    if "tool_id" not in perm_cols:
+        await db.execute("ALTER TABLE pending_permissions ADD COLUMN tool_id TEXT")
     await db.commit()
 
 
@@ -162,13 +184,14 @@ async def add_message(
     tool_name: str | None = None,
     tool_id: str | None = None,
     tool_input: str | None = None,
+    pending_request_id: str | None = None,
 ) -> int:
     now = time.time()
     db = await get_db()
     cursor = await db.execute(
-        """INSERT INTO messages (session_id, role, type, content, tool_name, tool_id, tool_input, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (session_id, role, type, content, tool_name, tool_id, tool_input, now),
+        """INSERT INTO messages (session_id, role, type, content, tool_name, tool_id, tool_input, pending_request_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (session_id, role, type, content, tool_name, tool_id, tool_input, pending_request_id, now),
     )
     await db.commit()
     # Bump session updated_at
@@ -197,6 +220,53 @@ async def get_message_count(session_id: str) -> int:
 # ------------------------------------------------------------------
 # Permission logging
 # ------------------------------------------------------------------
+
+# ------------------------------------------------------------------
+# Pending permission persistence
+# ------------------------------------------------------------------
+
+async def store_pending_permission(
+    *,
+    session_id: str,
+    request_id: str,
+    tool_name: str,
+    tool_id: str | None = None,
+    tool_input: str | None = None,
+) -> None:
+    now = time.time()
+    db = await get_db()
+    await db.execute(
+        """INSERT INTO pending_permissions (session_id, request_id, tool_name, tool_id, tool_input, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (session_id, request_id, tool_name, tool_id, tool_input, now),
+    )
+    await db.commit()
+
+
+async def remove_pending_permission(session_id: str, request_id: str) -> None:
+    db = await get_db()
+    await db.execute(
+        "DELETE FROM pending_permissions WHERE session_id = ? AND request_id = ?",
+        (session_id, request_id),
+    )
+    # Also clear the pending_request_id on the tool_use message so the UI
+    # doesn't show it as "pending_approval" after the page is reloaded.
+    await db.execute(
+        "UPDATE messages SET pending_request_id = NULL WHERE session_id = ? AND pending_request_id = ?",
+        (session_id, request_id),
+    )
+    await db.commit()
+
+
+async def get_pending_permissions(session_id: str) -> list[dict]:
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT * FROM pending_permissions WHERE session_id = ? ORDER BY id",
+        (session_id,),
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
 
 async def log_permission(
     *,

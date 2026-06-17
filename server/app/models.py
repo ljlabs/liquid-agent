@@ -121,6 +121,7 @@ class DBMessageInfo(BaseModel):
     tool_name: Optional[str] = None
     tool_id: Optional[str] = None
     tool_input: Optional[str] = None
+    pending_request_id: Optional[str] = None
     created_at: float
 
 

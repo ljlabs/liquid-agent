@@ -1,8 +1,9 @@
 import { state } from './state.js';
-import { dbFetch } from './api.js';
+import { dbFetch, fetchPendingPermissions } from './api.js';
 import { escapeHtml, formatTimeAgo } from './utils.js';
 import { loadSessionToolRules } from './permission-manager.js';
-import { appendUserMessage, appendAssistantStub, appendOrUpdateThinking, appendToolBlock, updateToolBlock } from './ui-components.js';
+import { appendUserMessage, appendAssistantStub, appendOrUpdateThinking, appendToolBlock, updateToolBlock, appendPermissionCard } from './ui-components.js';
+import { setAwaitingApproval } from './stream-handler.js';
 
 export async function loadSessionList() {
   try {
@@ -84,11 +85,12 @@ export async function switchToSession(sessionId, title, clickedItem) {
         } else if (msg.type === 'tool_use') {
           let input = {};
           try { input = JSON.parse(msg.tool_input || '{}'); } catch (_) {}
+          const toolStatus = msg.pending_request_id ? 'pending_approval' : 'running';
           appendToolBlock(bodyEl, {
             id: msg.tool_id || `hist_${msg.id}`,
             name: msg.tool_name || 'Tool',
             target: String(input.path || input.command || '').slice(0, 60),
-            status: 'running',
+            status: toolStatus,
             input,
           });
         }
@@ -113,6 +115,35 @@ export async function switchToSession(sessionId, title, clickedItem) {
           // After tool results, the NEXT assistant message will create a new bubble
           // (because each assistant message creates a new bubble)
         }
+      }
+    }
+
+    // Check for pending permissions after loading messages
+    const pendingPermissions = await fetchPendingPermissions(sessionId);
+    if (pendingPermissions.length > 0) {
+      console.log('[loadSession] Found pending permissions:', pendingPermissions.length);
+      state.pendingPermissions = pendingPermissions;
+      
+      // Find the last assistant message element to append permission cards
+      const conversation = document.getElementById('conversation');
+      const lastAssistantMsg = conversation.querySelector('.msg.assistant:last-of-type');
+      
+      if (lastAssistantMsg) {
+        const bodyEl = lastAssistantMsg.querySelector('.msg-body');
+        for (const perm of pendingPermissions) {
+          // Map database fields to the format appendPermissionCard expects
+          const permEvent = {
+            request_id: perm.request_id,
+            tool: perm.tool_name,
+            tool_input: perm.tool_input ? JSON.parse(perm.tool_input) : {},
+          };
+          appendPermissionCard(bodyEl, permEvent, () => {
+            setAwaitingApproval(false);
+            // Remove from pending list
+            state.pendingPermissions = state.pendingPermissions.filter(p => p.request_id !== perm.request_id);
+          });
+        }
+        setAwaitingApproval(true);
       }
     }
   } catch (e) {

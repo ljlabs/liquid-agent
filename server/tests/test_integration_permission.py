@@ -6,51 +6,39 @@ from app.sessions import Session
 @pytest.mark.asyncio
 async def test_real_sdk_permission_callback():
     """
-    Integration test connecting to the real ClaudeSDKClient to verify if
-    can_use_tool callback is triggered for a Bash command.
+    Integration test verifying if permission logic is triggered for a Bash command.
     """
-    # Use a dummy session ID and tmp directory
+    # Set environment for mock server
+    os.environ["ANTHROPIC_MODEL"] = "mock-model"
+    os.environ["ANTHROPIC_BASE_URL"] = "http://localhost:9002"
+
     session_id = "test_integration_perm"
     cwd = os.getcwd()
-    
+
     session = Session(session_id=session_id, cwd=cwd, permission_mode="default")
-    
+
     # Ensure Bash is set to 'ask'
     session.set_tool_rule("Bash", "ask")
-    
+
     await session.connect()
-    
+
     # We will track if the callback is ever triggered
     callback_triggered = asyncio.Event()
-    
-    # Wrap the original callback to detect invocation
-    original_callback = session._can_use_tool
-    
-    async def wrapped_callback(tool_name, tool_input, context):
-        print(f"\n!!! CALLBACK TRIGGERED: {tool_name} !!!\n")
-        callback_triggered.set()
-        return await original_callback(tool_name, tool_input, context)
-        
-    session._can_use_tool = wrapped_callback
-    
-    async def collect():
+
+    # In the current implementation, permissions are handled via _pending_permissions
+    # and a future. We can check if a permission request was created.
+    async def run_turn():
         async for _ in session.run_turn("run pwd"):
             pass
-            
-    print(f"\nStarting run_turn for tool call 'edit'...")
-    # Trigger a tool call
-    turn_task = asyncio.create_task(collect())
-    
-    # Try sending an edit command which should definitely trigger 'ask'
-    # Actually we just send a message that would provoke a tool call
-    # We can try to send a message that forces Edit
-    # The session will try to use the tool if the LLM decides to.
-    # Since we use the real SDK, we rely on it to invoke the tool.
-    
-    # Send a message that should provoke 'Edit' tool usage
-    # (Assuming we have a test prompt that triggers this)
-    # If this doesn't trigger it, we might need a better prompt
-    async def run():
-        async for _ in session.run_turn("edit the file /tmp/test.txt"):
-            pass
-    collect_task = asyncio.create_task(run())
+
+    turn_task = asyncio.create_task(run_turn())
+
+    # Wait for a permission request to appear in the session
+    for _ in range(20):
+        if session._pending_permissions:
+            callback_triggered.set()
+            break
+        await asyncio.sleep(0.1)
+
+    assert callback_triggered.is_set(), "Permission request was not triggered for 'run pwd'"
+    await turn_task

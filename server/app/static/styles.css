@@ -360,6 +360,9 @@ body {
 .tool-status.success { background: rgba(137,209,133,0.12); color: var(--ok); }
 .tool-status.error { background: rgba(244,135,113,0.12); color: var(--err); }
 .tool-status.pending { background: rgba(226,192,141,0.12); color: var(--warn); }
+.tool-status.pending_approval { background: rgba(226,192,141,0.12); color: var(--warn); }
+.tool-status.approved { background: rgba(137,209,133,0.12); color: var(--ok); }
+.tool-status.denied { background: rgba(244,135,113,0.12); color: var(--err); }
 
 .tool-body {
   border-top: 1px solid var(--border);

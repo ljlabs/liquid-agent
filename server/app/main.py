@@ -41,16 +41,20 @@ from .models import (
     ToolRuleInfo,
 )
 from .sessions import DEFAULT_TOOL_RULES, SDK_AVAILABLE, SessionManager
+from .view_data import ViewDataGenerator
 from . import database as db
 
 
 SDK_VERSION = "custom-wrapper-v1"
 
+view_generator: ViewDataGenerator = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global manager
+    global manager, view_generator
     manager = SessionManager()
+    view_generator = ViewDataGenerator(manager, db)
     yield
     await manager.close_all()
     await db.close_db()
@@ -215,6 +219,15 @@ async def set_tool_rule(session_id: str, req: PermissionRuleUpdate) -> dict[str,
     return {"tool": req.tool_name, "rule": req.rule}
 
 
+@app.get("/v1/sessions/{session_id}/pending-permissions")
+async def get_pending_permissions(session_id: str) -> dict:
+    """Return all pending permission requests for a session."""
+    session = manager.get(session_id)
+    if session is None:
+        return {"permissions": []}
+    return {"permissions": session.get_pending_permissions()}
+
+
 @app.get("/v1/sessions/{session_id}/tool-rules", response_model=ToolDefaultsResponse)
 async def get_session_tool_rules(session_id: str) -> ToolDefaultsResponse:
     session = manager.get(session_id)
@@ -257,29 +270,67 @@ async def get_tool_defaults() -> ToolDefaultsResponse:
 # Permission responses
 # ------------------------------------------------------------------
 
-@app.post("/v1/permissions/respond")
-async def respond_permission(req: PermissionDecisionRequest) -> dict[str, bool]:
-    for session in manager.list():
-        # Get pending permission before resolving to capture tool info
-        pending = session._pending_permissions.get(req.request_id)
-        
-        if session.resolve_permission(req.request_id, req.approved, req.always, req.deny_message):
-            # Log permission decision
-            if pending:
-                await db.log_permission(
-                    session_id=session.session_id,
-                    request_id=req.request_id,
-                    tool_name=pending.tool_name,
-                    tool_input=json.dumps(pending.tool_input) if pending.tool_input else None,
-                    approved=req.approved,
-                    always=req.always or False,
-                )
-            
-            if req.always:
-                rules = session.get_tool_rules()
-                await db.update_session(session.session_id, tool_rules=json.dumps(rules))
-            return {"resolved": True}
+@app.post("/v1/sessions/{session_id}/permissions/respond")
+async def respond_permission(session_id: str, req: PermissionDecisionRequest) -> dict[str, bool]:
+    session = manager.get(session_id)
+    if not session:
+        # Session was evicted from memory (e.g. after page refresh).
+        # Lazily recreate it so the pending permission can be resolved.
+        session = await manager.get_or_create(session_id)
+        if not session:
+            raise HTTPException(404, "session not found")
+
+    pending = session._pending_permissions.get(req.request_id)
+    if session.resolve_permission(req.request_id, req.approved, req.always, req.deny_message):
+        if pending:
+            await db.log_permission(
+                session_id=session.session_id,
+                request_id=req.request_id,
+                tool_name=pending.tool_name,
+                tool_input=json.dumps(pending.tool_input) if pending.tool_input else None,
+                approved=req.approved,
+                always=req.always or False,
+            )
+        if req.always:
+            rules = session.get_tool_rules()
+            await db.update_session(session.session_id, tool_rules=json.dumps(rules))
+        return {"resolved": True}
     raise HTTPException(404, "permission request not found (it may have already timed out)")
+
+
+@app.get("/v1/sessions/{session_id}/events")
+async def subscribe_session_events(session_id: str) -> StreamingResponse:
+    session = manager.get(session_id)
+    if not session:
+        # Lazily recreate so restored pending permissions are available
+        session = await manager.get_or_create(session_id)
+        if not session:
+            raise HTTPException(404, "session not found")
+
+    queue = session.subscribe_events()
+
+    async def event_stream():
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=30)
+                    yield _sse(event)
+                    if event.get("type") == "done":
+                        break
+                except asyncio.TimeoutError:
+                    yield _sse({"type": "heartbeat"})
+        finally:
+            session.unsubscribe_events(queue)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ------------------------------------------------------------------
@@ -396,6 +447,7 @@ async def stream(req: StreamRequest) -> StreamingResponse:
                         tool_name=event.get("name"),
                         tool_id=event.get("tool_id"),
                         tool_input=json.dumps(event.get("input", {}), default=str),
+                        pending_request_id=event.get("pending_request_id"),
                     )
                 elif etype == "tool_result":
                     await db.add_message(
@@ -444,6 +496,253 @@ async def stream(req: StreamRequest) -> StreamingResponse:
 
 def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload, default=str)}\n\n"
+
+
+# ------------------------------------------------------------------
+# View endpoint - single endpoint for all frontend communication
+# ------------------------------------------------------------------
+
+from pydantic import BaseModel as PydanticBaseModel
+from typing import Literal as TypingLiteral
+
+
+class ViewRequest(PydanticBaseModel):
+    """Request from frontend - single endpoint for all actions."""
+    action: TypingLiteral[
+        "send_message",
+        "switch_session",
+        "create_session",
+        "delete_session",
+        "interrupt",
+        "respond_permission",
+        "set_mode",
+        "set_model",
+        "update_tool_rule",
+        "get_view",
+    ]
+    session_id: str | None = None
+    message: str | None = None
+    model: str | None = None
+    permission_mode: str | None = None
+    tool_name: str | None = None
+    tool_rule: str | None = None
+    request_id: str | None = None
+    approved: bool | None = None
+    always: bool | None = None
+    cwd: str | None = None
+    include_messages: bool = True
+
+
+async def _run_turn_and_emit(session, message: str) -> None:
+    """Consume run_turn async generator and emit events to session queue."""
+    try:
+        async for event in session.run_turn(message):
+            await session._emit_event(event)
+    except Exception as exc:
+        await session._emit_event({"type": "error", "message": str(exc)})
+    finally:
+        await session._emit_event({"type": "done"})
+
+
+async def _process_view_action(req: ViewRequest) -> str | None:
+    """Process frontend action and update backend state. Returns target session_id."""
+
+    if req.action == "send_message":
+        session = await manager.get_or_create(req.session_id)
+        # Persist the user message
+        title = req.message[:60].strip() if req.message else "New Session"
+        db_session = await db.get_session(session.session_id)
+        if db_session is None:
+            await db.create_session(
+                session_id=session.session_id,
+                title=title,
+                cwd=session.cwd or "",
+                model=session.model,
+                permission_mode=session.permission_mode,
+            )
+        elif db_session.get("title") == "New Session":
+            await db.update_session(session.session_id, title=title, status="running")
+        else:
+            await db.update_session(session.session_id, status="running")
+        await db.add_message(
+            session_id=session.session_id,
+            role="user",
+            content=req.message or "",
+        )
+
+        async def _run_turn_background():
+            try:
+                async for event in session.run_turn(req.message or ""):
+                    await session._emit_event(event)
+            except Exception:
+                pass
+
+        asyncio.create_task(_run_turn_background())
+        return session.session_id
+
+    elif req.action == "switch_session":
+        if req.session_id:
+            await manager.get_or_create(req.session_id)
+        return req.session_id
+
+    elif req.action == "get_view":
+        return req.session_id
+
+    elif req.action == "create_session":
+        session = await manager.create(
+            session_id=req.session_id,
+            model=req.model,
+            cwd=req.cwd,
+        )
+        await db.create_session(
+            session_id=session.session_id,
+            title="New Session",
+            cwd=session.cwd or "",
+            model=session.model,
+            permission_mode=session.permission_mode,
+        )
+        return session.session_id
+
+    elif req.action == "delete_session":
+        if req.session_id:
+            await manager.close(req.session_id)
+            await db.delete_session(req.session_id)
+        return None
+
+    elif req.action == "interrupt":
+        if req.session_id:
+            session = manager.get(req.session_id)
+            if session:
+                await session.interrupt()
+        return req.session_id
+
+    elif req.action == "respond_permission":
+        if req.session_id:
+            session = manager.get(req.session_id)
+            if not session:
+                session = await manager.get_or_create(req.session_id)
+            if session and req.request_id:
+                resolved = session.resolve_permission(
+                    req.request_id,
+                    req.approved or False,
+                    req.always or False,
+                )
+                if not resolved:
+                    raise HTTPException(404, "permission request not found")
+        return req.session_id
+
+    elif req.action == "set_mode":
+        if req.session_id and req.permission_mode:
+            session = manager.get(req.session_id)
+            if session:
+                await session.set_permission_mode(req.permission_mode)
+                await db.update_session(req.session_id, permission_mode=req.permission_mode)
+        return req.session_id
+
+    elif req.action == "set_model":
+        if req.session_id and req.model:
+            session = manager.get(req.session_id)
+            if session:
+                await session.set_model(req.model)
+                await db.update_session(req.session_id, model=req.model)
+        return req.session_id
+
+    elif req.action == "update_tool_rule":
+        if req.session_id and req.tool_name and req.tool_rule:
+            session = manager.get(req.session_id)
+            if session:
+                session.set_tool_rule(req.tool_name, req.tool_rule)
+                rules = session.get_tool_rules()
+                await db.update_session(req.session_id, tool_rules=json.dumps(rules))
+        return req.session_id
+
+    return req.session_id
+
+
+@app.post("/v1/view")
+async def view_endpoint(req: ViewRequest):
+    """
+    Single endpoint for all frontend communication.
+    Processes the action, then returns a ViewData snapshot.
+    For streaming actions, the response is the initial ViewData;
+    the frontend subscribes to /v1/view/stream for live updates.
+    """
+    target_session_id = await _process_view_action(req)
+
+    view_data = await view_generator.generate(
+        session_id=target_session_id,
+        include_messages=req.include_messages,
+    )
+    return view_data.model_dump()
+
+
+@app.get("/v1/view/stream")
+async def view_stream(session_id: str | None = None):
+    """
+    Persistent SSE stream for live updates.
+    The frontend connects once and receives ViewData updates
+    whenever the backend state changes.
+    """
+
+    async def event_stream():
+        current_session_id = session_id
+        queue: asyncio.Queue | None = None
+
+        session = manager.get(current_session_id) if current_session_id else None
+        if not session and session_id:
+            session = await manager.get_or_create(session_id)
+            current_session_id = session.session_id
+
+        if session:
+            queue = session.subscribe_events()
+
+        try:
+            view_data = await view_generator.generate(
+                session_id=current_session_id,
+                include_messages=True,
+            )
+            yield _sse(view_data.model_dump())
+
+            # If session is idle and no queue, close immediately
+            if queue is None:
+                yield _sse({"type": "done"})
+                return
+
+            # If session is idle, send done and close
+            if view_data.ui_state and not view_data.ui_state.streaming:
+                yield _sse({"type": "done"})
+                return
+
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=30)
+                    if event.get("type") == "done":
+                        final_view = await view_generator.generate(
+                            session_id=current_session_id,
+                            include_messages=True,
+                        )
+                        yield _sse(final_view.model_dump())
+                        break
+                    updated_view = await view_generator.generate(
+                        session_id=current_session_id,
+                        include_messages=True,
+                    )
+                    yield _sse(updated_view.model_dump())
+                except asyncio.TimeoutError:
+                    yield _sse({"type": "heartbeat"})
+        finally:
+            if session and queue:
+                session.unsubscribe_events(queue)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ------------------------------------------------------------------
