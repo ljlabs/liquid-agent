@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import uuid
 import tempfile
 import shutil
 from pathlib import Path
@@ -17,18 +18,128 @@ from app import database as db
 
 
 # ---------------------------------------------------------------------------
+# Keyword → response mapping (mirrors mock_llm_server.py)
+# ---------------------------------------------------------------------------
+
+def _keyword_response(prompt_lower: str) -> list[dict] | None:
+    """Return a two-turn response list if the prompt matches a keyword."""
+    if "run pwd" in prompt_lower:
+        return [
+            {
+                "content": [
+                    {"type": "text", "text": "I'll run pwd for you."},
+                    {"type": "tool_use", "id": f"toolu_{uuid.uuid4().hex[:8]}",
+                     "name": "Bash", "input": {"command": "pwd"}},
+                ],
+                "stop_reason": "tool_use",
+            },
+            {
+                "content": [{"type": "text", "text": "The current directory is shown above."}],
+                "stop_reason": "end_turn",
+            },
+        ]
+    if "run ls" in prompt_lower:
+        return [
+            {
+                "content": [
+                    {"type": "text", "text": "I'll list the directory."},
+                    {"type": "tool_use", "id": f"toolu_{uuid.uuid4().hex[:8]}",
+                     "name": "Bash", "input": {"command": "ls"}},
+                ],
+                "stop_reason": "tool_use",
+            },
+            {
+                "content": [{"type": "text", "text": "Here are the files."}],
+                "stop_reason": "end_turn",
+            },
+        ]
+    if "echo" in prompt_lower:
+        return [
+            {
+                "content": [
+                    {"type": "text", "text": "Running echo."},
+                    {"type": "tool_use", "id": f"toolu_{uuid.uuid4().hex[:8]}",
+                     "name": "Bash", "input": {"command": "echo hello"}},
+                ],
+                "stop_reason": "tool_use",
+            },
+            {
+                "content": [{"type": "text", "text": "Echo completed."}],
+                "stop_reason": "end_turn",
+            },
+        ]
+    if "delete" in prompt_lower or "rm " in prompt_lower:
+        return [
+            {
+                "content": [
+                    {"type": "text", "text": "I'll remove that."},
+                    {"type": "tool_use", "id": f"toolu_{uuid.uuid4().hex[:8]}",
+                     "name": "Bash", "input": {"command": "rm -rf /tmp/test"}},
+                ],
+                "stop_reason": "tool_use",
+            },
+            {
+                "content": [{"type": "text", "text": "Deletion complete."}],
+                "stop_reason": "end_turn",
+            },
+        ]
+    if "edit" in prompt_lower:
+        return [
+            {
+                "content": [
+                    {"type": "text", "text": "I'll make that edit."},
+                    {"type": "tool_use", "id": f"toolu_{uuid.uuid4().hex[:8]}",
+                     "name": "Bash", "input": {"command": "echo edited"}},
+                ],
+                "stop_reason": "tool_use",
+            },
+            {
+                "content": [{"type": "text", "text": "Edit applied."}],
+                "stop_reason": "end_turn",
+            },
+        ]
+    return None
+
+
+def _extract_prompt(messages: list[dict]) -> str:
+    """Pull plain-text content from Anthropic messages list."""
+    parts = []
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        parts.append(block.get("text", ""))
+                    elif block.get("type") == "tool_result":
+                        parts.append(str(block.get("content", "")))
+    return " ".join(parts).lower()
+
+
+# ---------------------------------------------------------------------------
 # Mock LLM Client
 # ---------------------------------------------------------------------------
 
 
 class MockLLMClient:
-    """Deterministic mock LLM that returns configurable responses."""
+    """Deterministic mock LLM that returns configurable responses.
+
+    Supports two modes:
+    1. Explicit sequence — ``set_sequence([...])`` overrides everything.
+    2. Keyword routing — if no sequence is set, the prompt is inspected
+       for keywords ("run pwd", "echo", etc.) and the matching canned
+       response is returned.  Each keyword fires at most once; subsequent
+       calls return a plain-text终结 response so the agent loop exits.
+    """
 
     def __init__(self, options=None):
         self.options = options
         self._queue = asyncio.Queue()
-        self._sequence = []
-        self._seq_index = 0
+        self._sequence: list[dict] = []
+        self._seq_index: int = 0
+        self._kw_fired: set[str] = set()
 
     def set_sequence(self, sequence):
         self._sequence = sequence
@@ -40,6 +151,50 @@ class MockLLMClient:
     async def disconnect(self):
         pass
 
+    def _pick_response(self, messages: list[dict]) -> dict:
+        """Choose a response: keyword match > explicit sequence > default."""
+        prompt = _extract_prompt(messages)
+
+        # keyword routing — each keyword fires at most once
+        kw = _keyword_response(prompt)
+        if kw:
+            # Find which keyword matched
+            matched_kw = None
+            for kw_str in ("run pwd", "run ls", "echo", "delete", "rm ", "edit"):
+                if kw_str in prompt:
+                    matched_kw = kw_str
+                    break
+
+            if matched_kw and matched_kw not in self._kw_fired:
+                self._kw_fired.add(matched_kw)
+                resp = dict(kw[0])
+                for block in resp.get("content", []):
+                    if block.get("type") == "tool_use":
+                        block["id"] = f"toolu_{uuid.uuid4().hex[:8]}"
+                return resp
+
+            # Keyword already fired — return终结 text so the loop ends
+            return {
+                "content": [{"type": "text", "text": "Done."}],
+                "stop_reason": "end_turn",
+            }
+
+        # explicit sequence
+        if self._sequence:
+            idx = min(self._seq_index, len(self._sequence) - 1)
+            resp = dict(self._sequence[idx])
+            self._seq_index += 1
+            for block in resp.get("content", []):
+                if block.get("type") == "tool_use":
+                    block["id"] = f"toolu_{uuid.uuid4().hex[:8]}"
+            return resp
+
+        # default: plain text
+        return {
+            "content": [{"type": "text", "text": "Mock response"}],
+            "stop_reason": "end_turn",
+        }
+
     async def query(self, content):
         prompt_text = ""
         if hasattr(content, "__aiter__"):
@@ -49,76 +204,63 @@ class MockLLMClient:
         else:
             prompt_text = str(content)
 
-        # Pick response from sequence
-        if self._sequence:
-            idx = min(self._seq_index, len(self._sequence) - 1)
-            resp = self._sequence[idx]
-            self._seq_index += 1
-        else:
-            # Default: text only
-            resp = {
-                "content": [{"type": "text", "text": f"Mock response to: {prompt_text[:50]}"}],
-                "stop_reason": "end_turn",
-            }
+        messages = [{"role": "user", "content": prompt_text}]
+        resp = self._pick_response(messages)
 
-        # Handle tool_use blocks — check permission via callback
+        # Emit events the old way (for legacy callers)
         for block in resp.get("content", []):
             if block.get("type") == "tool_use":
-                tool_name = block["name"]
-                tool_input = block["input"]
-                tool_id = block["id"]
-
                 await self._queue.put({
                     "type": "content_block_start",
                     "content_block": {
                         "type": "tool_use",
-                        "id": tool_id,
-                        "name": tool_name,
-                        "input": tool_input,
+                        "id": block["id"],
+                        "name": block["name"],
+                        "input": block["input"],
                     },
                 })
                 await asyncio.sleep(0.005)
 
                 class Ctx:
-                    display_name = tool_name
-                    description = f"Run {tool_name}"
-                    title = f"Run {tool_name}"
+                    display_name = block["name"]
+                    description = f"Run {block['name']}"
+                    title = f"Run {block['name']}"
 
                 if self.options and getattr(self.options, "can_use_tool", None):
                     try:
-                        perm_res = await self.options.can_use_tool(tool_name, tool_input, Ctx())
+                        perm_res = await self.options.can_use_tool(
+                            block["name"], block["input"], Ctx()
+                        )
                         is_allow = isinstance(perm_res, PermissionResultAllow) or (
                             type(perm_res).__name__ == "PermissionResultAllow"
                         )
                         if is_allow:
                             await self._queue.put({
                                 "type": "tool_result",
-                                "tool_id": tool_id,
-                                "output": f"mock output for {tool_name}",
+                                "tool_id": block["id"],
+                                "output": f"mock output for {block['name']}",
                             })
                         else:
                             await self._queue.put({
                                 "type": "tool_error",
-                                "tool_id": tool_id,
+                                "tool_id": block["id"],
                                 "error": "Permission denied by user",
                             })
                     except Exception as e:
                         await self._queue.put({
                             "type": "tool_error",
-                            "tool_id": tool_id,
+                            "tool_id": block["id"],
                             "error": str(e),
                         })
                 else:
-                    # No permission callback — auto-allow
                     await self._queue.put({
                         "type": "tool_result",
-                        "tool_id": tool_id,
-                        "output": f"mock output for {tool_name}",
+                        "tool_id": block["id"],
+                        "output": f"mock output for {block['name']}",
                     })
 
                 await asyncio.sleep(0.005)
 
-        # Emit text blocks
         for block in resp.get("content", []):
             if block.get("type") == "text":
                 await self._queue.put({"type": "text", "data": block["text"]})
@@ -126,24 +268,12 @@ class MockLLMClient:
         await self._queue.put({"type": "message_stop"})
 
     async def chat_completion(self, messages, system=None, tools=None, stream=False):
-        """Chat completion interface matching CustomLLMWrapper."""
-        # Pick response from sequence
-        if self._sequence:
-            idx = min(self._seq_index, len(self._sequence) - 1)
-            resp = self._sequence[idx]
-            self._seq_index += 1
-        else:
-            resp = {
-                "content": [{"type": "text", "text": "Mock response"}],
-                "stop_reason": "end_turn",
-            }
+        """Chat completion interface matching CustomLLMWrapper.
 
-        # Inject unique tool_use IDs
-        for block in resp.get("content", []):
-            if block.get("type") == "tool_use" and not block.get("id", "").startswith("toolu_"):
-                block["id"] = f"toolu_{uuid.uuid4().hex[:8]}"
-
-        # Return the response as a dict (the session expects this)
+        Called once per LLM turn.  Returns the single response dict as an
+        async generator (one yield).
+        """
+        resp = self._pick_response(messages)
         yield resp
 
     async def receive_response(self):

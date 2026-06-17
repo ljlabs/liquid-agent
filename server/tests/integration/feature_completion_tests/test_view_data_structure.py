@@ -19,6 +19,7 @@ async def test_view_data_top_level_fields(client):
     assert "usage" in view
     assert "tool_call_log" in view
     assert "session_log" in view
+    assert "available_models" in view
 
 
 @pytest.mark.asyncio
@@ -117,3 +118,62 @@ async def test_session_log_structure(client):
     sid = await create_session(client)
     view = await get_view(client, sid)
     assert isinstance(view["session_log"], list)
+
+
+@pytest.mark.asyncio
+async def test_available_models_in_get_view(client):
+    """available_models is present and contains expected model names."""
+    view = await get_view(client)
+    models = view["available_models"]
+    assert isinstance(models, list)
+    assert len(models) > 0
+    assert all(isinstance(m, str) for m in models)
+
+
+@pytest.mark.asyncio
+async def test_available_models_includes_mock_model(client):
+    """available_models includes mock-model."""
+    view = await get_view(client)
+    assert "mock-model" in view["available_models"]
+
+
+@pytest.mark.asyncio
+async def test_available_models_includes_standard_models(client):
+    """available_models includes standard Claude and GPT models."""
+    view = await get_view(client)
+    models = view["available_models"]
+    assert "claude-sonnet-4-6" in models
+    assert "claude-haiku-4-5" in models
+
+
+@pytest.mark.asyncio
+async def test_available_models_in_sse_stream(client):
+    """available_models is present in SSE stream ViewData events."""
+    import json
+    import asyncio
+
+    sid = await create_session(client)
+    found_models = None
+
+    async with client.stream("GET", f"/v1/view/stream?session_id={sid}") as resp:
+        async for line in resp.aiter_lines():
+            if line.startswith("data: "):
+                data = json.loads(line[6:])
+                if data.get("type") == "view":
+                    if "available_models" in data:
+                        found_models = data["available_models"]
+                    break
+
+    assert found_models is not None
+    assert isinstance(found_models, list)
+    assert len(found_models) > 0
+    assert "mock-model" in found_models
+
+
+@pytest.mark.asyncio
+async def test_available_models_after_create_session(client):
+    """available_models is still present after creating a session."""
+    sid = await create_session(client)
+    view = await get_view(client, sid)
+    assert "available_models" in view
+    assert len(view["available_models"]) > 0

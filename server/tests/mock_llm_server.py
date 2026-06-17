@@ -2,6 +2,18 @@
 Mock LLM Server — Anthropic Messages API compatible.
 
 Responds with configurable sequences: text, tool_use, or mixed.
+Supports keyword-based routing: if the user prompt contains a known
+keyword, the matching canned response is returned regardless of the
+sequence index.
+
+Keyword map
+-----------
+  "run pwd"  → Bash(pwd), then text referencing the output
+  "run ls"   → Bash(ls), then text
+  "echo"     → Bash(echo hello), then text
+  "delete"   → Bash(rm -rf /), then text (for deny testing)
+  "edit"     → Bash(echo edit), then text
+
 Used by integration tests to drive the agent loop deterministically.
 """
 
@@ -24,6 +36,125 @@ _stats: dict[str, Any] = {
 # Response sequence — each entry is returned in order, then the last one repeats.
 _response_sequence: list[dict] = []
 _response_index = 0
+
+
+# ---------------------------------------------------------------------------
+# Keyword → response mapping
+# ---------------------------------------------------------------------------
+
+def _keyword_response(prompt_lower: str) -> list[dict] | None:
+    """Return a two-turn response list if the prompt matches a keyword."""
+    if "run pwd" in prompt_lower:
+        return [
+            {
+                "content": [
+                    {"type": "text", "text": "I'll run pwd for you."},
+                    {
+                        "type": "tool_use",
+                        "id": f"toolu_{uuid.uuid4().hex[:8]}",
+                        "name": "Bash",
+                        "input": {"command": "pwd"},
+                    },
+                ],
+                "stop_reason": "tool_use",
+            },
+            {
+                "content": [
+                    {"type": "text", "text": "The current directory is shown above."},
+                ],
+                "stop_reason": "end_turn",
+            },
+        ]
+
+    if "run ls" in prompt_lower:
+        return [
+            {
+                "content": [
+                    {"type": "text", "text": "I'll list the directory."},
+                    {
+                        "type": "tool_use",
+                        "id": f"toolu_{uuid.uuid4().hex[:8]}",
+                        "name": "Bash",
+                        "input": {"command": "ls"},
+                    },
+                ],
+                "stop_reason": "tool_use",
+            },
+            {
+                "content": [
+                    {"type": "text", "text": "Here are the files."},
+                ],
+                "stop_reason": "end_turn",
+            },
+        ]
+
+    if "echo" in prompt_lower:
+        return [
+            {
+                "content": [
+                    {"type": "text", "text": "Running echo."},
+                    {
+                        "type": "tool_use",
+                        "id": f"toolu_{uuid.uuid4().hex[:8]}",
+                        "name": "Bash",
+                        "input": {"command": "echo hello"},
+                    },
+                ],
+                "stop_reason": "tool_use",
+            },
+            {
+                "content": [
+                    {"type": "text", "text": "Echo completed."},
+                ],
+                "stop_reason": "end_turn",
+            },
+        ]
+
+    if "delete" in prompt_lower or "rm " in prompt_lower:
+        return [
+            {
+                "content": [
+                    {"type": "text", "text": "I'll remove that."},
+                    {
+                        "type": "tool_use",
+                        "id": f"toolu_{uuid.uuid4().hex[:8]}",
+                        "name": "Bash",
+                        "input": {"command": "rm -rf /tmp/test"},
+                    },
+                ],
+                "stop_reason": "tool_use",
+            },
+            {
+                "content": [
+                    {"type": "text", "text": "Deletion complete."},
+                ],
+                "stop_reason": "end_turn",
+            },
+        ]
+
+    if "edit" in prompt_lower:
+        return [
+            {
+                "content": [
+                    {"type": "text", "text": "I'll make that edit."},
+                    {
+                        "type": "tool_use",
+                        "id": f"toolu_{uuid.uuid4().hex[:8]}",
+                        "name": "Bash",
+                        "input": {"command": "echo edited"},
+                    },
+                ],
+                "stop_reason": "tool_use",
+            },
+            {
+                "content": [
+                    {"type": "text", "text": "Edit applied."},
+                ],
+                "stop_reason": "end_turn",
+            },
+        ]
+
+    return None
 
 
 def _default_sequence():
@@ -52,8 +183,40 @@ def _default_sequence():
     ]
 
 
-def _next_response():
+def _extract_prompt(body: dict) -> str:
+    """Pull a plain-text prompt from an Anthropic Messages API body."""
+    messages = body.get("messages", [])
+    parts = []
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        parts.append(block.get("text", ""))
+                    elif block.get("type") == "tool_result":
+                        parts.append(str(block.get("content", "")))
+    return " ".join(parts).lower()
+
+
+def _next_response(body: dict | None = None):
     global _response_index
+
+    # --- keyword routing (takes priority over sequence) ---
+    if body:
+        prompt = _extract_prompt(body)
+        kw = _keyword_response(prompt)
+        if kw:
+            idx = min(_response_index, len(kw) - 1)
+            resp = kw[idx]
+            # Only advance the index so turn 2 comes back on the next call
+            if _response_index < len(kw) - 1:
+                _response_index += 1
+            return resp
+
+    # --- fallback to explicit sequence ---
     if not _response_sequence:
         resp_data = _default_sequence()
     else:
@@ -81,7 +244,7 @@ async def anthropic_messages(request: Request):
         return JSONResponse(status_code=400, content={"error": "Invalid JSON"})
 
     await asyncio.sleep(0.02)
-    resp = _next_response()
+    resp = _next_response(body)
 
     return JSONResponse(content={
         "id": f"msg_{uuid.uuid4().hex[:12]}",
@@ -104,7 +267,7 @@ async def openai_chat_completions(request: Request):
         return JSONResponse(status_code=400, content={"error": "Invalid JSON"})
 
     await asyncio.sleep(0.02)
-    resp = _next_response()
+    resp = _next_response(body)
 
     # Convert Anthropic format to OpenAI format
     text_parts = []
@@ -183,6 +346,7 @@ def main():
     _stats["start_time"] = time.time()
     print(f"Mock LLM Server on {args.host}:{args.port}")
     print(f"  Endpoints: POST /v1/messages, POST /v1/chat/completions")
+    print(f"  Keywords: run pwd, run ls, echo, delete, edit")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 
