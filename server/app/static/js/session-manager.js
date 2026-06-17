@@ -88,7 +88,7 @@ export async function createNewSession() {
       method: 'POST',
       body: JSON.stringify({
         cwd: document.getElementById('cwd-input')?.value || '',
-        model: document.getElementById('model-select')?.value || 'claude-sonnet-4-6',
+        model: document.getElementById('model-select')?.value || 'gemma-4-31b',
       }),
     });
 

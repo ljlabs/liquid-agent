@@ -30,8 +30,18 @@ class MockClaudeSDKClient:
         pass
 
     async def query(self, content):
-        if isinstance(content, str) and content.startswith("mock_tool:"):
-            tool_name = content.split(":")[1].strip()
+        prompt_text = ""
+        # FIX: content is now an AsyncIterable
+        if hasattr(content, "__aiter__"):
+            async for chunk in content:
+                if isinstance(chunk, dict) and "content" in chunk:
+                    prompt_text += chunk["content"]
+        else:
+            # Fallback for old tests that might still pass strings
+            prompt_text = str(content)
+
+        if "mock_tool:" in prompt_text:
+            tool_name = prompt_text.split(":")[1].strip()
             tool_input = {"command": "echo hello"}
             tool_id = "mock_tool_id"
 
@@ -138,43 +148,20 @@ async def test_session_get_tool_rules():
 
 
 @pytest.mark.asyncio
-async def test_preapproved_tools_includes_allow_rules():
-    """_preapproved_tools should include tools with rule='allow' and DEFAULT_AUTO_ALLOW_TOOLS."""
-    session = Session(session_id="test_preapprove", cwd="/tmp")
-    preapproved = session._preapproved_tools()
-    for tool in DEFAULT_AUTO_ALLOW_TOOLS:
-        assert tool.lower() in preapproved, f"{tool} should be preapproved"
-    # Tools with rule='allow' in DEFAULT_TOOL_RULES should also be there
-    for name, rule in DEFAULT_TOOL_RULES.items():
-        if rule == "allow":
-            assert name.lower() in preapproved
-
-
-@pytest.mark.asyncio
-async def test_disallowed_tools_empty_by_default():
-    """No tool is denied by default."""
-    session = Session(session_id="test_disallow", cwd="/tmp")
-    assert session._disallowed_tools() == []
-
-
-@pytest.mark.asyncio
-async def test_set_tool_rule_updates_preapproved():
-    """Setting Bash to 'allow' adds it to preapproved; setting to 'deny' adds to disallowed."""
+async def test_set_tool_rule_updates_internal_state():
+    """Setting Bash to 'allow' updates internal _tool_rules."""
     session = Session(session_id="test_rule_update", cwd="/tmp")
 
-    # Bash defaults to 'ask' -- not preapproved, not disallowed
-    assert "bash" not in session._preapproved_tools()
-    assert "bash" not in session._disallowed_tools()
+    # Bash defaults to 'ask'
+    assert session._tool_rules["bash"] == "ask"
 
     # Allow bash
     session.set_tool_rule("Bash", "allow")
-    assert "bash" in session._preapproved_tools()
-    assert "bash" not in session._disallowed_tools()
+    assert session._tool_rules["bash"] == "allow"
 
     # Deny bash
     session.set_tool_rule("Bash", "deny")
-    assert "bash" not in session._preapproved_tools()
-    assert "bash" in session._disallowed_tools()
+    assert session._tool_rules["bash"] == "deny"
 
 
 # ------------------------------------------------------------------

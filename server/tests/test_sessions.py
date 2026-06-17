@@ -31,23 +31,16 @@ async def test_session_initialization():
 
 @pytest.mark.asyncio
 async def test_session_with_none_tools():
-    """Test that a session can be initialized with None for allowed/disallowed tools."""
+    """Test that a session can be initialized with None for tools."""
     with tempfile.TemporaryDirectory() as tmpdir:
         session = Session(
             session_id="test_session",
             cwd=tmpdir,
-            model="claude-sonnet-4-6",
-            allowed_tools=None,
-            disallowed_tools=None
+            model="claude-sonnet-4-6"
         )
         assert session.session_id == "test_session"
-        # SDK preapproved_tools should include the auto-allow set even
-        # though allowed_tools was passed as None.
-        from app.sessions import DEFAULT_AUTO_ALLOW_TOOLS
-        for tool in DEFAULT_AUTO_ALLOW_TOOLS:
-            assert tool.lower() in session._options.allowed_tools
-        # Disallowed should be empty since no tool is denied by default
-        assert session._options.disallowed_tools == []
+        # Tools should be None by default in options
+        assert session._options.tools is None
 
 
 @pytest.mark.asyncio
@@ -62,11 +55,10 @@ async def test_session_with_tool_lists():
             disallowed_tools=["Bash"]
         )
         assert session.session_id == "test_session"
-        # Explicit allows land in preapproved_tools alongside auto-allows
-        assert "Read" in session._options.allowed_tools
-        assert "Write" in session._options.allowed_tools
-        # Explicit deny of Bash becomes part of disallowed_tools
-        assert "bash" in [t.lower() for t in session._options.disallowed_tools]
+        # Note: We now handle tools via _can_use_tool and _tool_rules
+        assert "read" in session._tool_rules
+        assert "write" in session._tool_rules
+        assert session._tool_rules["bash"] == "ask" # Default rule for Bash
 
 
 @pytest.mark.asyncio

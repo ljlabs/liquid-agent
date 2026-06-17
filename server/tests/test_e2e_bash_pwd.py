@@ -15,7 +15,16 @@ class EndToEndMockClaudeClient:
         pass
 
     async def query(self, content):
-        if content == "run pwd in your bash tool and tell me the result":
+        # The prompt is now an AsyncIterable, so consume it
+        prompt_text = ""
+        if hasattr(content, "__aiter__"):
+            async for chunk in content:
+                if isinstance(chunk, dict) and "content" in chunk:
+                    prompt_text += chunk["content"]
+        else:
+            prompt_text = content
+
+        if "pwd" in prompt_text:
             tool_name = "Bash"
             tool_input = {"command": "pwd"}
             tool_id = "tool_pwd_123"

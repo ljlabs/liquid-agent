@@ -8,28 +8,6 @@ if sys.platform == 'win32':
 
 """
 FastAPI wrapper around the Claude Agent SDK.
-
-Endpoints map directly onto the actions the index.html UI takes:
-
-  POST   /v1/sessions                 create a session, return its id
-  GET    /v1/sessions                 list active sessions
-  DELETE /v1/sessions/{session_id}    close a session
-  POST   /v1/sessions/stream          send a message, stream the response (SSE)
-  POST   /v1/sessions/{id}/interrupt  interrupt the current turn
-  POST   /v1/sessions/{id}/permission-mode   change permission mode
-  POST   /v1/sessions/{id}/model      change model
-  POST   /v1/sessions/{id}/tool-rule  set an always-allow/deny rule for a tool
-  POST   /v1/permissions/respond      resolve a pending permission_request
-  GET    /v1/health                   health + SDK availability check
-
-  GET    /v1/db/sessions              list persisted sessions
-  GET    /v1/db/sessions/{id}         get a single persisted session
-  GET    /v1/db/sessions/{id}/messages get messages for a session
-
-The SSE stream emits ` <json>\n\n` lines matching the event shapes
-the UI's handleStreamEvent() function expects (type: text, tool_use,
-tool_result, tool_error, permission_request, planning_complete, result,
-error).
 """
 
 import json
@@ -66,12 +44,7 @@ from .sessions import DEFAULT_TOOL_RULES, SDK_AVAILABLE, SessionManager
 from . import database as db
 
 
-try:
-    import claude_agent_sdk
-
-    SDK_VERSION = getattr(claude_agent_sdk, "__version__", "unknown")
-except ImportError:  # pragma: no cover
-    SDK_VERSION = None
+SDK_VERSION = "custom-wrapper-v1"
 
 
 @asynccontextmanager
@@ -98,7 +71,6 @@ manager: SessionManager = None
 # Health
 # ------------------------------------------------------------------
 
-
 @app.get("/v1/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     return HealthResponse(
@@ -110,14 +82,11 @@ async def health() -> HealthResponse:
 
 
 # ------------------------------------------------------------------
-# In-memory session lifecycle (for live SDK connections)
+# In-memory session lifecycle
 # ------------------------------------------------------------------
-
 
 @app.post("/v1/sessions", response_model=SessionInfo)
 async def create_session(req: SessionCreateRequest) -> SessionInfo:
-    if not SDK_AVAILABLE:
-        raise HTTPException(503, "claude_agent_sdk is not installed on the server")
 
     session = await manager.create(
         cwd=req.cwd,
@@ -131,7 +100,6 @@ async def create_session(req: SessionCreateRequest) -> SessionInfo:
         include_partial_messages=req.include_partial_messages,
     )
 
-    # Eagerly persist to DB
     await db.create_session(
         session_id=session.session_id,
         title="New Session",
@@ -172,13 +140,10 @@ def _session_info(session) -> SessionInfo:
 # Persistent session endpoints (SQLite)
 # ------------------------------------------------------------------
 
-
 @app.get("/v1/db/sessions", response_model=DBSessionListResponse)
 async def list_db_sessions() -> DBSessionListResponse:
     sessions = await db.list_sessions()
-    return DBSessionListResponse(
-        sessions=[DBSessionInfo(**s) for s in sessions]
-    )
+    return DBSessionListResponse(sessions=[DBSessionInfo(**s) for s in sessions])
 
 
 @app.get("/v1/db/sessions/{session_id}", response_model=DBSessionInfo)
@@ -191,7 +156,6 @@ async def get_db_session(session_id: str) -> DBSessionInfo:
 
 @app.delete("/v1/db/sessions/{session_id}")
 async def delete_db_session(session_id: str) -> dict[str, bool]:
-    # Also close the live session if it exists
     await manager.close(session_id)
     deleted = await db.delete_session(session_id)
     if not deleted:
@@ -205,15 +169,12 @@ async def get_db_messages(session_id: str) -> DBMessageListResponse:
     if session is None:
         raise HTTPException(404, "session not found")
     messages = await db.get_messages(session_id)
-    return DBMessageListResponse(
-        messages=[DBMessageInfo(**m) for m in messages]
-    )
+    return DBMessageListResponse(messages=[DBMessageInfo(**m) for m in messages])
 
 
 # ------------------------------------------------------------------
 # Mid-session controls
 # ------------------------------------------------------------------
-
 
 @app.post("/v1/sessions/{session_id}/interrupt")
 async def interrupt_session(session_id: str) -> dict[str, bool]:
@@ -230,12 +191,8 @@ async def set_permission_mode(session_id: str, req: SetPermissionModeRequest) ->
     if not session:
         raise HTTPException(404, "session not found")
     await session.set_permission_mode(req.permission_mode)
-
-    # Persist to DB
     await db.update_session(session_id, permission_mode=req.permission_mode)
-
     return {"permission_mode": session.permission_mode}
-
 
 
 @app.post("/v1/sessions/{session_id}/model")
@@ -253,18 +210,13 @@ async def set_tool_rule(session_id: str, req: PermissionRuleUpdate) -> dict[str,
     if not session:
         raise HTTPException(404, "session not found")
     session.set_tool_rule(req.tool_name, req.rule)
-
-    # Persist to DB
     rules = session.get_tool_rules()
     await db.update_session(session_id, tool_rules=json.dumps(rules))
-
     return {"tool": req.tool_name, "rule": req.rule}
-
 
 
 @app.get("/v1/sessions/{session_id}/tool-rules", response_model=ToolDefaultsResponse)
 async def get_session_tool_rules(session_id: str) -> ToolDefaultsResponse:
-    """Return the effective tool rules for a live session."""
     session = manager.get(session_id)
     if session is None:
         raise HTTPException(404, "session not found")
@@ -277,9 +229,6 @@ async def get_session_tool_rules(session_id: str) -> ToolDefaultsResponse:
 
 @app.get("/v1/tool-defaults", response_model=ToolDefaultsResponse)
 async def get_tool_defaults() -> ToolDefaultsResponse:
-    """Canonical tool list and the default rule for each, before any
-    session is created. The UI uses this to render the sidebar when no
-    session is active so it never displays mocked values."""
     return ToolDefaultsResponse(
         tools=list(DEFAULT_TOOL_RULES.keys()),
         rules=[ToolRuleInfo(tool=name, rule=rule) for name, rule in DEFAULT_TOOL_RULES.items()],
@@ -287,16 +236,13 @@ async def get_tool_defaults() -> ToolDefaultsResponse:
 
 
 # ------------------------------------------------------------------
-# Permission responses (from the in-chat Allow/Deny buttons)
+# Permission responses
 # ------------------------------------------------------------------
-
 
 @app.post("/v1/permissions/respond")
 async def respond_permission(req: PermissionDecisionRequest) -> dict[str, bool]:
     for session in manager.list():
-        if session.resolve_permission(
-            req.request_id, req.approved, req.always, req.deny_message
-        ):
+        if session.resolve_permission(req.request_id, req.approved, req.always, req.deny_message):
             if req.always:
                 rules = session.get_tool_rules()
                 await db.update_session(session.session_id, tool_rules=json.dumps(rules))
@@ -308,15 +254,11 @@ async def respond_permission(req: PermissionDecisionRequest) -> dict[str, bool]:
 # Streaming chat endpoint
 # ------------------------------------------------------------------
 
-
 @app.post("/v1/sessions/stream")
 async def stream(req: StreamRequest) -> StreamingResponse:
-    if not SDK_AVAILABLE:
-        raise HTTPException(503, "claude_agent_sdk is not installed on the server")
 
-    # Persist a DB record if one doesn't exist yet for this session
     db_session = await db.get_session(req.session_id) if req.session_id else None
-    
+
     initial_tool_rules = None
     if db_session and db_session.get("tool_rules"):
         try:
@@ -339,7 +281,6 @@ async def stream(req: StreamRequest) -> StreamingResponse:
     )
 
     if db_session is None:
-        # Generate a title from the first message (first 60 chars)
         title = req.message[:60].strip() or "New Session"
         await db.create_session(
             session_id=session.session_id,
@@ -350,41 +291,41 @@ async def stream(req: StreamRequest) -> StreamingResponse:
             tool_rules=json.dumps(session.get_tool_rules()),
         )
     elif db_session.get("title") == "New Session":
-        # Update title from the first real message if it's still the default
         new_title = req.message[:60].strip() or "New Session"
         await db.update_session(session.session_id, title=new_title, status="running")
     else:
-        # Update status to running
         await db.update_session(session.session_id, status="running")
 
-    # Save the user message
     await db.add_message(
         session_id=session.session_id,
         role="user",
         content=req.message,
     )
 
+    # ── FIX: auto_approve sets the permission mode BEFORE run_turn, not
+    # during the turn setup, and only on the session object (not via the
+    # live SDK set_permission_mode which fires a mid-session SystemMessage).
+    # We update session.permission_mode directly so the _can_use_tool
+    # callback sees it, without sending a redundant set_permission_mode
+    # command over the already-connected client.
     if req.auto_approve and session.permission_mode == "default":
-        await session.set_permission_mode("acceptEdits")
+        session.permission_mode = "acceptEdits"
+        if session._options is not None:
+            session._options.permission_mode = "acceptEdits"
         await db.update_session(session.session_id, permission_mode="acceptEdits")
 
     async def event_stream() -> AsyncIterator[str]:
-        # Accumulate assistant text for persistence
         assistant_text_buffer = ""
-        turn_tool_calls: list[dict] = []
 
-        # Always tell the UI which session this turn belongs to first.
-        db_session = await db.get_session(session.session_id)
-        yield _sse(
-            {
-                "type": "session",
-                "session_id": session.session_id,
-                "title": db_session.get("title") if db_session else "New Session",
-                "cwd": session.cwd,
-                "model": session.model,
-                "permission_mode": session.permission_mode,
-            }
-        )
+        db_sess = await db.get_session(session.session_id)
+        yield _sse({
+            "type": "session",
+            "session_id": session.session_id,
+            "title": db_sess.get("title") if db_sess else "New Session",
+            "cwd": session.cwd,
+            "model": session.model,
+            "permission_mode": session.permission_mode,
+        })
 
         try:
             async for event in session.run_turn(
@@ -394,7 +335,6 @@ async def stream(req: StreamRequest) -> StreamingResponse:
             ):
                 yield _sse(event)
 
-                # Persist relevant events
                 etype = event.get("type")
                 if etype == "text":
                     assistant_text_buffer += event.get("data", "")
@@ -416,12 +356,6 @@ async def stream(req: StreamRequest) -> StreamingResponse:
                             content=assistant_text_buffer,
                         )
                         assistant_text_buffer = ""
-                    tool_data = {
-                        "tool_id": event.get("tool_id"),
-                        "name": event.get("name"),
-                        "input": event.get("input"),
-                    }
-                    turn_tool_calls.append(tool_data)
                     await db.add_message(
                         session_id=session.session_id,
                         role="assistant",
@@ -448,17 +382,14 @@ async def stream(req: StreamRequest) -> StreamingResponse:
                         tool_id=event.get("tool_id"),
                     )
                 elif etype == "result":
-                    # Persist the accumulated assistant text
                     if assistant_text_buffer:
                         await db.add_message(
                             session_id=session.session_id,
                             role="assistant",
                             content=assistant_text_buffer,
                         )
-                    await db.update_session(
-                        session.session_id,
-                        status="idle",
-                    )
+                    await db.update_session(session.session_id, status="idle")
+
         except asyncio.CancelledError:
             await db.update_session(session.session_id, status="idle")
             raise
@@ -484,8 +415,7 @@ def _sse(payload: dict) -> str:
 
 
 # ------------------------------------------------------------------
-# Static UI (serves index.html at /) — mounted last so it doesn't shadow
-# the /v1/* API routes above.
+# Static UI
 # ------------------------------------------------------------------
 
 STATIC_DIR = Path(__file__).parent / "static"

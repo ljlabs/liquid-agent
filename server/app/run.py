@@ -5,7 +5,7 @@ import os
 
 
 os.environ["ANTHROPIC_BASE_URL"] = "http://localhost:8000"
-os.environ["ANTHROPIC_MODEL "] = "gemma-4-31b"
+os.environ["ANTHROPIC_MODEL"] = "opencode-agent-1"
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
