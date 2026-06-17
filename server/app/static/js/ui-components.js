@@ -130,10 +130,9 @@ export function updateToolBlock(block, updates) {
 }
 
 export function appendPermissionCard(bodyEl, event, onRespond) {
-  if (bodyEl.querySelector('.permission-card')) return;
-
   const card = document.createElement('div');
   card.className = 'permission-card';
+  card.dataset.requestId = event.request_id;
   card.innerHTML = `
     <div class="ptitle">
       <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M8 1l6 3v4c0 4-2.7 6.5-6 7-3.3-.5-6-3-6-7V4l6-3z"/></svg>
