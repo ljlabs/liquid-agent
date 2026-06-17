@@ -349,6 +349,11 @@ class Session:
                 "content": tool_results
             })
 
+            # Continue to next turn - call LLM again with tool results
+            if not self._interrupt_flag and tool_results:
+                logger.info(f"Continuing to next turn with tool results")
+                continue
+
         self.status = "idle"
         yield {"type": "result", "num_turns": turn_count}
 

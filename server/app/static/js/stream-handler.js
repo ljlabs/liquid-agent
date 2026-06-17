@@ -125,15 +125,10 @@ export function handleStreamEvent(event, msgEl) {
     case 'text':
       let activeTextEl = bodyEl.querySelector('.msg-content.streaming-active');
       if (!activeTextEl) {
-        const initialTextEl = bodyEl.querySelector('.msg-content');
-        if (initialTextEl && !initialTextEl.classList.contains('rendered')) {
-          activeTextEl = initialTextEl;
-          activeTextEl.classList.add('streaming-active');
-        } else {
-          activeTextEl = document.createElement('div');
-          activeTextEl.className = 'msg-content markdown-body streaming-active';
-          bodyEl.appendChild(activeTextEl);
-        }
+        // Always create a new text element for each response
+        activeTextEl = document.createElement('div');
+        activeTextEl.className = 'msg-content markdown-body streaming-active';
+        bodyEl.appendChild(activeTextEl);
       }
 
       let textVal = activeTextEl.dataset.fullText || '';

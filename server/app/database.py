@@ -63,7 +63,19 @@ async def _init_schema(db: aiosqlite.Connection) -> None:
             created_at  REAL NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS permissions (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            request_id  TEXT NOT NULL,
+            tool_name   TEXT NOT NULL,
+            tool_input  TEXT,
+            approved    INTEGER NOT NULL,
+            always      INTEGER NOT NULL DEFAULT 0,
+            created_at  REAL NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
+        CREATE INDEX IF NOT EXISTS idx_permissions_session ON permissions(session_id, id);
     """)
     # Backwards-compat: add tool_rules JSON column if it doesn't already
     # exist. Older databases (created before this column shipped) get the
@@ -180,3 +192,27 @@ async def get_message_count(session_id: str) -> int:
     )
     row = await cursor.fetchone()
     return row["cnt"] if row else 0
+
+
+# ------------------------------------------------------------------
+# Permission logging
+# ------------------------------------------------------------------
+
+async def log_permission(
+    *,
+    session_id: str,
+    request_id: str,
+    tool_name: str,
+    tool_input: str | None = None,
+    approved: bool = False,
+    always: bool = False,
+) -> int:
+    now = time.time()
+    db = await get_db()
+    cursor = await db.execute(
+        """INSERT INTO permissions (session_id, request_id, tool_name, tool_input, approved, always, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (session_id, request_id, tool_name, tool_input, 1 if approved else 0, 1 if always else 0, now),
+    )
+    await db.commit()
+    return cursor.lastrowid

@@ -218,8 +218,26 @@ async def set_tool_rule(session_id: str, req: PermissionRuleUpdate) -> dict[str,
 @app.get("/v1/sessions/{session_id}/tool-rules", response_model=ToolDefaultsResponse)
 async def get_session_tool_rules(session_id: str) -> ToolDefaultsResponse:
     session = manager.get(session_id)
+    
+    # If session not in memory, try to load from database
     if session is None:
-        raise HTTPException(404, "session not found")
+        db_session = await db.get_session(session_id)
+        if db_session and db_session.get("tool_rules"):
+            try:
+                rules_dict = json.loads(db_session["tool_rules"])
+                return ToolDefaultsResponse(
+                    tools=list(DEFAULT_TOOL_RULES.keys()),
+                    rules=[ToolRuleInfo(tool=name, rule=rules_dict.get(name, "ask")) 
+                           for name in DEFAULT_TOOL_RULES],
+                )
+            except Exception:
+                pass
+        # Fall back to defaults if session not found or no rules stored
+        return ToolDefaultsResponse(
+            tools=list(DEFAULT_TOOL_RULES.keys()),
+            rules=[ToolRuleInfo(tool=name, rule=rule) for name, rule in DEFAULT_TOOL_RULES.items()],
+        )
+    
     rules = session.get_tool_rules()
     return ToolDefaultsResponse(
         tools=list(DEFAULT_TOOL_RULES.keys()),
@@ -242,7 +260,21 @@ async def get_tool_defaults() -> ToolDefaultsResponse:
 @app.post("/v1/permissions/respond")
 async def respond_permission(req: PermissionDecisionRequest) -> dict[str, bool]:
     for session in manager.list():
+        # Get pending permission before resolving to capture tool info
+        pending = session._pending_permissions.get(req.request_id)
+        
         if session.resolve_permission(req.request_id, req.approved, req.always, req.deny_message):
+            # Log permission decision
+            if pending:
+                await db.log_permission(
+                    session_id=session.session_id,
+                    request_id=req.request_id,
+                    tool_name=pending.tool_name,
+                    tool_input=json.dumps(pending.tool_input) if pending.tool_input else None,
+                    approved=req.approved,
+                    always=req.always or False,
+                )
+            
             if req.always:
                 rules = session.get_tool_rules()
                 await db.update_session(session.session_id, tool_rules=json.dumps(rules))

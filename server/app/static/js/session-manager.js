@@ -36,24 +36,49 @@ export async function switchToSession(sessionId, title, clickedItem) {
   try {
     const data = await dbFetch(`/v1/db/sessions/${sessionId}/messages`);
     let currentAssistantEl = null;
+    let lastRole = null;
 
     for (const msg of data.messages) {
+      console.log('[loadSession] Processing message:', msg.role, msg.type, msg.content?.substring(0, 50));
+      
       if (msg.role === 'user') {
+        // New user message = new conversation turn
         currentAssistantEl = null;
         appendUserMessage(msg.content);
-      } else {
-        if (!currentAssistantEl) {
-          currentAssistantEl = appendAssistantStub();
-          currentAssistantEl.querySelector('.cursor-blink')?.remove();
-          currentAssistantEl.querySelector('.msg-content')?.remove();
-        }
+      } else if (msg.role === 'assistant') {
+        // Each assistant message creates a NEW message bubble
+        // This ensures multi-turn conversations are properly separated
+        currentAssistantEl = appendAssistantStub();
+        currentAssistantEl.querySelector('.cursor-blink')?.remove();
+        
         const bodyEl = currentAssistantEl.querySelector('.msg-body');
+        lastRole = msg.role;
 
         if (msg.type === 'text' && msg.content) {
-          const contentEl = document.createElement('div');
-          contentEl.className = 'msg-content markdown-body rendered';
-          contentEl.innerHTML = marked.parse(msg.content);
-          bodyEl.appendChild(contentEl);
+          // Ensure there's a content element for thinking blocks to insert before
+          let contentEl = bodyEl.querySelector('.msg-content');
+          if (!contentEl) {
+            contentEl = document.createElement('div');
+            contentEl.className = 'msg-content markdown-body rendered';
+            bodyEl.appendChild(contentEl);
+          }
+          
+          // Parse thinking tags from stored content
+          const thoughtRegex = /<thought>([\s\S]*?)<\/thought>/g;
+          let cleanedContent = msg.content;
+          let match;
+          
+          while ((match = thoughtRegex.exec(msg.content)) !== null) {
+            // Create thinking block for each thought found
+            appendOrUpdateThinking(currentAssistantEl, { data: match[1], done: true });
+            // Remove thought tags from content
+            cleanedContent = cleanedContent.replace(match[0], '');
+          }
+          
+          // Only add content element if there's non-thinking content
+          if (cleanedContent.trim()) {
+            contentEl.innerHTML = marked.parse(cleanedContent.trim());
+          }
         } else if (msg.type === 'thinking' && msg.content) {
           appendOrUpdateThinking(currentAssistantEl, { data: msg.content, done: true });
         } else if (msg.type === 'tool_use') {
@@ -66,7 +91,18 @@ export async function switchToSession(sessionId, title, clickedItem) {
             status: 'running',
             input,
           });
-        } else if (msg.type === 'tool_result' || msg.type === 'tool_error') {
+        }
+      } else if (msg.role === 'tool') {
+        // Tool messages should be attached to the previous assistant message
+        if (!currentAssistantEl) {
+          console.warn('[loadSession] Skipping tool message - no assistant context:', msg);
+          continue;
+        }
+        
+        const bodyEl = currentAssistantEl.querySelector('.msg-body');
+        lastRole = msg.role;
+
+        if (msg.type === 'tool_result' || msg.type === 'tool_error') {
           const toolBlock = bodyEl.querySelector(`[data-tool-id="${msg.tool_id}"]`);
           if (toolBlock) {
             updateToolBlock(toolBlock, {
@@ -74,6 +110,8 @@ export async function switchToSession(sessionId, title, clickedItem) {
               output: msg.content,
             });
           }
+          // After tool results, the NEXT assistant message will create a new bubble
+          // (because each assistant message creates a new bubble)
         }
       }
     }

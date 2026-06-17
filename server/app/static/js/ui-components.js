@@ -159,6 +159,11 @@ export function appendPermissionCard(bodyEl, event, onRespond) {
       result.textContent = `→ ${btn.textContent}`;
       card.appendChild(result);
 
+      // Hide the card after a short delay
+      setTimeout(() => {
+        card.style.display = 'none';
+      }, 1000);
+
       if (onRespond) onRespond();
     });
   });
