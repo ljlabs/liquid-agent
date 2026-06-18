@@ -3,3 +3,4 @@
 **/venv/*
 server/data/
 server/data/
+server/.coverage

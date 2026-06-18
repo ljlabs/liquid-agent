@@ -66,3 +66,10 @@ The frontend is a single `index.html` file — no build step. The UI sends messa
 - **Integration Tests**: Used for end-to-end verification. These may hit mock servers or test databases.
 - **Turn Counting**: A "turn" is defined as a single LLM response. Total session turns are the sum of all agent responses.
 
+## Documentation Maintenance
+
+Whenever a feature is added, modified, or removed, the following guides MUST be updated to ensure the documentation stays in sync with the implementation:
+- `documents/guides/feature_walkthrough.md`: Update the feature description and expected behavior.
+- `documents/guides/test_dependency_report.md`: Update the dependency mapping and impact analysis.
+- `documents/guides/test_feature_mapping.md`: Update the test-to-feature mapping matrix.
+
