@@ -571,11 +571,59 @@ async def _process_view_action(req: ViewRequest) -> str | None:
         )
 
         async def _run_turn_background():
+            assistant_text_buffer = ""
             try:
                 async for event in session.run_turn(req.message or ""):
                     await session._emit_event(event)
+
+                    etype = event.get("type")
+                    if etype == "text":
+                        assistant_text_buffer += event.get("data", "")
+                    elif etype == "tool_use":
+                        if assistant_text_buffer:
+                            await db.add_message(
+                                session_id=session.session_id,
+                                role="assistant",
+                                content=assistant_text_buffer,
+                            )
+                            assistant_text_buffer = ""
+                        await db.add_message(
+                            session_id=session.session_id,
+                            role="assistant",
+                            type="tool_use",
+                            content=json.dumps(event.get("input", {}), default=str),
+                            tool_name=event.get("name"),
+                            tool_id=event.get("tool_id"),
+                            tool_input=json.dumps(event.get("input", {}), default=str),
+                            pending_request_id=event.get("pending_request_id"),
+                        )
+                    elif etype == "tool_result":
+                        await db.add_message(
+                            session_id=session.session_id,
+                            role="tool",
+                            type="tool_result",
+                            content=str(event.get("output", "")),
+                            tool_id=event.get("tool_id"),
+                        )
+                    elif etype == "tool_error":
+                        await db.add_message(
+                            session_id=session.session_id,
+                            role="tool",
+                            type="tool_error",
+                            content=str(event.get("error", "")),
+                            tool_id=event.get("tool_id"),
+                        )
+                    elif etype == "result":
+                        if assistant_text_buffer:
+                            await db.add_message(
+                                session_id=session.session_id,
+                                role="assistant",
+                                content=assistant_text_buffer,
+                            )
+                        await db.update_session(session.session_id, status="idle")
             except Exception:
-                pass
+                session.status = "idle"
+                await db.update_session(session.session_id, status="idle")
 
         asyncio.create_task(_run_turn_background())
         return session.session_id

@@ -17,81 +17,61 @@ async def setup_db():
 @pytest.mark.asyncio
 async def test_session_tool_call_flow():
     """Test that a tool call from the LLM triggers the permission flow and executes correctly."""
-    session = Session(session_id="test_sess")
-    
-    # First response has a tool call
-    resp1 = [
-        {
-            "choices": [{
-                "delta": {
-                    "tool_calls": [{
-                        "index": 0,
-                        "id": "call_123",
-                        "function": {"name": "Bash", "arguments": '{"command": "echo hello"}'}
-                    }]
+    from unittest import mock as _mock
+
+    class MockLLMForFlow:
+        def __init__(self, **kwargs):
+            self.model = kwargs.get("model", "mock")
+            self._turn = 0
+
+        async def chat_completion(self, messages, system=None, tools=None, stream=False):
+            self._turn += 1
+            if self._turn == 1:
+                yield {
+                    "content": [
+                        {"type": "text", "text": "Running command."},
+                        {"type": "tool_use", "id": "call_123", "name": "Bash", "input": {"command": "echo hello"}},
+                    ],
+                    "stop_reason": "tool_use",
                 }
-            }]
-        },
-        {}
-    ]
-    
-    # Second response (after tool result) has final text
-    resp2 = [
-        {
-            "choices": [{
-                "delta": {
-                    "content": "Finished task"
+            else:
+                yield {
+                    "content": [{"type": "text", "text": "Finished task"}],
+                    "stop_reason": "end_turn",
                 }
-            }]
-        },
-        {}
-    ]
-    
-    responses_list = [resp1, resp2]
-    resp_index = 0
 
-    with mock.patch("app.llm.httpx.AsyncClient.stream") as mock_stream:
-        # We need a dynamic mock for multiple calls
-        async def mock_stream_context(*args, **kwargs):
-            nonlocal resp_index
-            mock_resp = mock.MagicMock()
-            mock_resp.status_code = 200
-            
-            current_resp = responses_list[resp_index]
-            resp_index += 1
-            
-            async def mock_aiter_lines():
-                for r in current_resp:
-                    yield f"data: {json.dumps(r)}"
-                yield "data: [DONE]"
-                
-            mock_resp.aiter_lines = mock_aiter_lines
-            return mock_resp
+    session = Session(session_id="test_sess", permission_mode="default")
 
-        mock_stream.return_value.__aenter__ = mock_stream_context
+    with _mock.patch("app.sessions.CustomLLMWrapper", MockLLMForFlow):
+        session._llm = MockLLMForFlow()
 
-        # Run the turn
         gen = session.run_turn("test message")
-        
+
+        # Turn 1: text
+        event = await gen.__anext__()
+        assert event["type"] == "text"
+        assert event["data"] == "Running command."
+
         # Turn 1: tool_use
         event = await gen.__anext__()
         assert event["type"] == "tool_use"
-        
+        assert event["name"] == "Bash"
+
         # Turn 1: permission_request
         event = await gen.__anext__()
         assert event["type"] == "permission_request"
         request_id = event["request_id"]
         session.resolve_permission(request_id, approved=True)
-        
+
         # Turn 1: tool_result
         event = await gen.__anext__()
         assert event["type"] == "tool_result"
-        
+
         # Turn 2: text
         event = await gen.__anext__()
         assert event["type"] == "text"
         assert event["data"] == "Finished task"
-        
+
         # Turn 2: result
         event = await gen.__anext__()
         assert event["type"] == "result"

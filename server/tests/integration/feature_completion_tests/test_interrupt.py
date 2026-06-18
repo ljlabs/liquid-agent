@@ -20,24 +20,14 @@ async def test_interrupt_stops_running_session(client, manager, view_gen):
     # Create a slow mock LLM
     class SlowMockLLM:
         def __init__(self, **kwargs):
-            self.options = kwargs.get("options")
-            self._queue = asyncio.Queue()
+            self.model = kwargs.get("model", "slow")
 
-        async def connect(self):
-            pass
-
-        async def disconnect(self):
-            pass
-
-        async def query(self, content):
-            await asyncio.sleep(5)  # Simulate slow response
-
-        async def receive_response(self):
-            while True:
-                ev = await self._queue.get()
-                yield ev
-                if ev.get("type") == "message_stop":
-                    break
+        async def chat_completion(self, messages, system=None, tools=None, stream=False):
+            await asyncio.sleep(1)
+            yield {
+                "content": [{"type": "text", "text": "Done."}],
+                "stop_reason": "end_turn",
+            }
 
     with mock.patch("app.sessions.CustomLLMWrapper", SlowMockLLM):
 
@@ -47,7 +37,7 @@ async def test_interrupt_stops_running_session(client, manager, view_gen):
             "action": "send_message", "session_id": sid, "message": "slow task",
         }))
 
-        await asyncio.sleep(0.2)  # Let it start
+        await asyncio.sleep(0.3)  # Let it start the LLM call
 
         # Interrupt
         r = await client.post("/v1/view", json={
@@ -55,7 +45,8 @@ async def test_interrupt_stops_running_session(client, manager, view_gen):
         })
         assert r.status_code == 200
 
-        await asyncio.sleep(0.5)
+        # Wait for the LLM sleep to finish + interrupt to be processed
+        await asyncio.sleep(2)
 
         view = await get_view(client, sid)
         assert view["active_session"]["status"] == "idle"

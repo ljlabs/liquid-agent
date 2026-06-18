@@ -614,7 +614,7 @@ class Session:
                         "description": f"Allow {tool_name}?",
                         "title": f"Run {tool_name}",
                     }
-                    result = await self._pending_permissions[pending_request_id].future
+                    result = await pending.future
                     allowed = result.get("approved", False)
                 
                 if allowed:

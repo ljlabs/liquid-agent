@@ -227,7 +227,7 @@ async def test_db_list_sessions_empty(async_client_with_db):
 
 @pytest.mark.asyncio
 async def test_db_session_not_found(async_client_with_db):
-    """Test that fetching a non-existent DB session returns 404."""
+    """Test that fetching a non-existent DB session returns no active_session."""
     response = await async_client_with_db.post("/v1/view", json={"action": "get_view", "session_id": "nonexistent"})
     assert response.status_code == 200
     data = response.json()
@@ -297,7 +297,7 @@ async def test_db_list_sessions_empty(async_client_with_db):
 
 @pytest.mark.asyncio
 async def test_db_session_not_found(async_client_with_db):
-    """Test that fetching a non-existent DB session returns 404."""
+    """Test that fetching a non-existent DB session returns no active_session."""
     response = await async_client_with_db.post("/v1/view", json={"action": "get_view", "session_id": "nonexistent"})
     assert response.status_code == 200
     data = response.json()

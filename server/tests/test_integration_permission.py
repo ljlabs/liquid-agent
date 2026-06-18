@@ -1,44 +1,44 @@
 import asyncio
 import pytest
 import os
+import httpx
 from app.sessions import Session
 
+
 @pytest.mark.asyncio
-async def test_real_sdk_permission_callback():
+async def test_real_sdk_permission_callback(mock_llm_server):
     """
     Integration test verifying if permission logic is triggered for a Bash command.
+    Uses the mock LLM server started by conftest.
     """
-    # Set environment for mock server
-    os.environ["ANTHROPIC_MODEL"] = "mock-model"
-    os.environ["ANTHROPIC_BASE_URL"] = "http://localhost:9002"
+    # Reset mock server state before test
+    async with httpx.AsyncClient() as c:
+        await c.post(f"http://127.0.0.1:{mock_llm_server}/reset", timeout=10)
 
     session_id = "test_integration_perm"
     cwd = os.getcwd()
 
-    session = Session(session_id=session_id, cwd=cwd, permission_mode="default")
-
-    # Ensure Bash is set to 'ask'
+    session = Session(session_id=session_id, cwd=cwd, permission_mode="default", model="mock-model")
     session.set_tool_rule("Bash", "ask")
 
     await session.connect()
 
-    # We will track if the callback is ever triggered
-    callback_triggered = asyncio.Event()
+    events = []
 
-    # In the current implementation, permissions are handled via _pending_permissions
-    # and a future. We can check if a permission request was created.
-    async def run_turn():
-        async for _ in session.run_turn("run pwd"):
-            pass
+    async def collect():
+        async for ev in session.run_turn("run pwd"):
+            events.append(ev)
 
-    turn_task = asyncio.create_task(run_turn())
+    turn_task = asyncio.create_task(collect())
 
-    # Wait for a permission request to appear in the session
-    for _ in range(20):
+    for _ in range(50):
         if session._pending_permissions:
-            callback_triggered.set()
             break
         await asyncio.sleep(0.1)
 
-    assert callback_triggered.is_set(), "Permission request was not triggered for 'run pwd'"
-    await turn_task
+    assert len(session._pending_permissions) >= 1, "Permission request was not triggered for 'run pwd'"
+
+    req_id = list(session._pending_permissions.keys())[0]
+    session.resolve_permission(req_id, approved=True)
+
+    await asyncio.wait_for(turn_task, timeout=5)

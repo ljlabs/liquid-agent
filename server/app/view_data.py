@@ -347,7 +347,7 @@ class ViewDataGenerator:
                     content_blocks=content_blocks,
                     tool_name=msg.get("tool_name"),
                     tool_id=msg.get("tool_id"),
-                    tool_input=msg.get("tool_input"),
+                    tool_input=self._coerce_tool_input(msg.get("tool_input")),
                     status=self._get_message_status(msg, session),
                     created_at=msg.get("created_at", time.time()),
                 ))
@@ -362,6 +362,23 @@ class ViewDataGenerator:
             elif block.get("type") == "thinking":
                 parts.append(f"<thought>{block.get('thinking', '')}</thought>")
         return "".join(parts)
+
+    @staticmethod
+    def _coerce_tool_input(value) -> Optional[dict]:
+        """Ensure tool_input is a dict or None, never a raw string."""
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                pass
+            return {"raw": value}
+        return None
 
     def _parse_content_blocks(self, content: list) -> list[ContentBlock]:
         """Parse Anthropic content blocks into structured format."""

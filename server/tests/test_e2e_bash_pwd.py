@@ -1,138 +1,70 @@
 import asyncio
 import pytest
 from unittest import mock
-from app.sessions import Session, PermissionResultAllow, PermissionResultDeny
+from app.sessions import Session
 
-class EndToEndMockClaudeClient:
-    def __init__(self, options=None):
-        self.options = options
-        self._queue = asyncio.Queue()
 
-    async def connect(self):
-        pass
+class MockLLMPwd:
+    """Mock LLM that returns a Bash pwd tool_use, then a text response."""
 
-    async def disconnect(self):
-        pass
+    def __init__(self, **kwargs):
+        self.model = kwargs.get("model", "mock")
+        self._turn = 0
 
-    async def query(self, content):
-        # The prompt is now an AsyncIterable, so consume it
-        prompt_text = ""
-        if hasattr(content, "__aiter__"):
-            async for chunk in content:
-                if isinstance(chunk, dict) and "content" in chunk:
-                    prompt_text += chunk["content"]
+    async def chat_completion(self, messages, system=None, tools=None, stream=False):
+        self._turn += 1
+        if self._turn == 1:
+            yield {
+                "content": [
+                    {"type": "text", "text": "I'll run pwd."},
+                    {"type": "tool_use", "id": "tool_pwd_123", "name": "Bash", "input": {"command": "pwd"}},
+                ],
+                "stop_reason": "tool_use",
+            }
         else:
-            prompt_text = content
+            yield {
+                "content": [{"type": "text", "text": "Done."}],
+                "stop_reason": "end_turn",
+            }
 
-        if "pwd" in prompt_text:
-            tool_name = "Bash"
-            tool_input = {"command": "pwd"}
-            tool_id = "tool_pwd_123"
-
-            # 1. Start tool use
-            await self._queue.put({
-                "type": "content_block_start",
-                "content_block": {
-                    "type": "tool_use",
-                    "id": tool_id,
-                    "name": tool_name,
-                    "input": tool_input
-                }
-            })
-            
-            # Simulate some delay
-            await asyncio.sleep(0.01)
-
-            # 2. Check permission
-            class MockContext:
-                display_name = tool_name
-                description = "Run a bash command"
-                title = "Run Bash"
-            context = MockContext()
-
-            if self.options and hasattr(self.options, "can_use_tool"):
-                try:
-                    # This should block until the test resolves the permission
-                    perm_res = await self.options.can_use_tool(tool_name, tool_input, context)
-                    
-                    is_allowed = False
-                    if isinstance(perm_res, PermissionResultAllow) or type(perm_res).__name__ == "PermissionResultAllow":
-                        is_allowed = True
-                    
-                    if is_allowed:
-                        await self._queue.put({
-                            "type": "tool_result",
-                            "tool_id": tool_id,
-                            "output": "/c/Users/jorda/Documents/workspace/model_containment/server"
-                        })
-                    else:
-                        await self._queue.put({
-                            "type": "tool_error",
-                            "tool_id": tool_id,
-                            "error": "Permission denied"
-                        })
-                except Exception as e:
-                    await self._queue.put({
-                        "type": "tool_error",
-                        "tool_id": tool_id,
-                        "error": str(e)
-                    })
-            
-            await self._queue.put({"type": "message_stop"})
-
-    async def receive_response(self):
-        while True:
-            ev = await self._queue.get()
-            yield ev
-            if ev.get("type") == "message_stop":
-                break
 
 @pytest.mark.asyncio
 async def test_e2e_bash_pwd_permission_flow():
     """
     Test that 'Bash(pwd)' blocks for permission and only returns the result after approval.
     """
-    with mock.patch("app.sessions.ClaudeSDKClient", EndToEndMockClaudeClient), \
-         mock.patch("app.sessions.IS_MOCK", True):
-
-        session = Session(session_id="test_e2e", cwd="/tmp")
-        await session.connect()
+    with mock.patch("app.sessions.CustomLLMWrapper", MockLLMPwd):
+        session = Session(session_id="test_e2e", cwd="/tmp", permission_mode="default")
+        session._llm = MockLLMPwd()
 
         events = []
         async def collect():
-            async for ev in session.run_turn("run pwd in your bash tool and tell me the result"):
+            async for ev in session.run_turn("run pwd"):
                 events.append(ev)
-        
+
         collect_task = asyncio.create_task(collect())
-        
-        # Wait for the permission request to be emitted
-        # We need to give it enough time to run through content_block_start and hit can_use_tool
-        for _ in range(10):
+
+        for _ in range(20):
             await asyncio.sleep(0.1)
             if any(e["type"] == "permission_request" for e in events):
                 break
-        
-        # Assert that we have a permission request but NO tool result yet
+
         event_types = [e["type"] for e in events]
         assert "permission_request" in event_types
-        assert "tool_result" not in event_types, "Tool should NOT have responded with a result before permission"
-        
-        # Check that it's blocked
+        assert "tool_result" not in event_types
+
         assert len(session._pending_permissions) == 1
         req_id = list(session._pending_permissions.keys())[0]
-        
-        # Now resolve the permission
+
         session.resolve_permission(req_id, approved=True)
-        
-        # Wait for completion
+
         await collect_task
-        
-        # Final assertions
+
         final_event_types = [e["type"] for e in events]
         assert "tool_result" in final_event_types
-        
-        # Verify the actual output
+        assert "text" in final_event_types
+
         result_event = next(e for e in events if e["type"] == "tool_result")
-        assert result_event["output"] == "/c/Users/jorda/Documents/workspace/model_containment/server"
+        assert result_event["output"].strip(), "Tool result should not be empty"
 
         await session.close()
