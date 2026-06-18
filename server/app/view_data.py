@@ -182,7 +182,7 @@ class ViewDataGenerator:
                     title = db_session.get("title", "New Session")
                     updated_at = db_session.get("updated_at", session.created_at)
 
-                turn_count = sum(1 for m in session.messages if m.get("role") == "user")
+                turn_count = sum(1 for m in session.messages if m.get("role") == "assistant")
 
                 active_session = SessionView(
                     id=session.session_id,
@@ -264,31 +264,104 @@ class ViewDataGenerator:
         ]
 
     def _build_messages(self, session) -> list[MessageView]:
-        """Convert session messages to view format with structured blocks."""
+        """Convert session messages to view format with structured blocks.
+
+        Handles two message shapes from run_turn():
+          - assistant messages with list content containing text + tool_use blocks
+          - user messages with list content containing tool_result blocks
+        """
         messages: list[MessageView] = []
         for i, msg in enumerate(session.messages):
-            content_blocks = None
-            if msg.get("role") == "assistant":
-                raw_content = msg.get("content")
-                if isinstance(raw_content, list):
-                    content_blocks = self._parse_content_blocks(raw_content)
-                elif isinstance(raw_content, str) and raw_content:
-                    content_blocks = self._parse_thought_string(raw_content)
+            role = msg.get("role", "user")
+            raw_content = msg.get("content", "")
 
-            view_msg = MessageView(
-                id=i,
-                role=msg.get("role", "user"),
-                type=self._get_message_type(msg),
-                content=self._extract_content(msg),
-                content_blocks=content_blocks,
-                tool_name=msg.get("tool_name"),
-                tool_id=msg.get("tool_id"),
-                tool_input=msg.get("tool_input"),
-                status=self._get_message_status(msg, session),
-                created_at=msg.get("created_at", time.time()),
-            )
-            messages.append(view_msg)
+            if role == "assistant" and isinstance(raw_content, list):
+                text_blocks = []
+                tool_uses = []
+                for block in raw_content:
+                    btype = block.get("type")
+                    if btype in ("text", "thinking"):
+                        text_blocks.append(block)
+                    elif btype == "tool_use":
+                        tool_uses.append(block)
+
+                content_blocks = self._parse_content_blocks(text_blocks) if text_blocks else []
+                text_content = self._extract_content_from_blocks(text_blocks)
+
+                if content_blocks or text_content:
+                    messages.append(MessageView(
+                        id=len(messages),
+                        role="assistant",
+                        type="text",
+                        content=text_content,
+                        content_blocks=content_blocks,
+                        created_at=msg.get("created_at", time.time()),
+                    ))
+
+                for tb in tool_uses:
+                    tid = tb.get("id", "")
+                    tname = tb.get("name", "")
+                    tinput = tb.get("input", {})
+                    status = "running"
+                    if session._pending_permissions:
+                        for pending in session._pending_permissions.values():
+                            if pending.tool_name == tname:
+                                status = "pending_approval"
+                                break
+                    messages.append(MessageView(
+                        id=len(messages),
+                        role="assistant",
+                        type="tool_use",
+                        content=json.dumps(tinput, default=str),
+                        tool_name=tname,
+                        tool_id=tid,
+                        tool_input=tinput,
+                        status=status,
+                        created_at=msg.get("created_at", time.time()),
+                    ))
+
+            elif role == "user" and isinstance(raw_content, list):
+                for block in raw_content:
+                    if block.get("type") == "tool_result":
+                        messages.append(MessageView(
+                            id=len(messages),
+                            role="tool",
+                            type="tool_error" if block.get("is_error") else "tool_result",
+                            content=block.get("content", ""),
+                            tool_id=block.get("tool_use_id", ""),
+                            status="error" if block.get("is_error") else "success",
+                            created_at=msg.get("created_at", time.time()),
+                        ))
+
+            else:
+                content_blocks = None
+                if role == "assistant":
+                    if isinstance(raw_content, str) and raw_content:
+                        content_blocks = self._parse_thought_string(raw_content)
+
+                messages.append(MessageView(
+                    id=len(messages),
+                    role=role,
+                    type=self._get_message_type(msg),
+                    content=self._extract_content(msg),
+                    content_blocks=content_blocks,
+                    tool_name=msg.get("tool_name"),
+                    tool_id=msg.get("tool_id"),
+                    tool_input=msg.get("tool_input"),
+                    status=self._get_message_status(msg, session),
+                    created_at=msg.get("created_at", time.time()),
+                ))
         return messages
+
+    def _extract_content_from_blocks(self, blocks: list) -> str:
+        """Extract text content from a list of text/thinking blocks."""
+        parts = []
+        for block in blocks:
+            if block.get("type") == "text":
+                parts.append(block.get("text", ""))
+            elif block.get("type") == "thinking":
+                parts.append(f"<thought>{block.get('thinking', '')}</thought>")
+        return "".join(parts)
 
     def _parse_content_blocks(self, content: list) -> list[ContentBlock]:
         """Parse Anthropic content blocks into structured format."""

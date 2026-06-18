@@ -55,4 +55,14 @@ The frontend is a single `index.html` file — no build step. The UI sends messa
 ## Dependencies
 
 - `fastapi`, `uvicorn[standard]`, `pydantic` — standard FastAPI stack
-- `claude-agent-sdk` — wraps the Claude Code CLI; shelled out to for actual inference
+
+
+## Testing Guidelines
+
+- **Unit Tests**: Must be isolated and fast. 
+  - NEVER call real LLM APIs, databases, or external dependencies.
+  - Real tools must NEVER be triggered unless the tool itself is the unit under test.
+  - Use `unittest.mock` or `pytest-mock` to isolate the unit under test.
+- **Integration Tests**: Used for end-to-end verification. These may hit mock servers or test databases.
+- **Turn Counting**: A "turn" is defined as a single LLM response. Total session turns are the sum of all agent responses.
+
