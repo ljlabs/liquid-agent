@@ -327,3 +327,64 @@ async def test_run_ls_deny_flow(client, manager, view_gen):
         error_msgs = [m for m in view["messages"] if m["type"] == "tool_error"]
         assert len(error_msgs) >= 1
         assert view["active_session"]["status"] == "idle"
+
+
+@pytest.mark.asyncio
+async def test_deny_halts_agent_loop_integration(client, manager, view_gen):
+    """After denying a tool call, the agent loop halts and does not produce
+    an extra assistant response. The session goes idle immediately."""
+    main.manager = manager
+    main.view_generator = view_gen
+
+    with _patch_mock_llm():
+        sid = await create_session(client)
+        await client.post("/v1/view", json={
+            "action": "update_tool_rule", "session_id": sid,
+            "tool_name": "Bash", "tool_rule": "ask",
+        })
+
+        await client.post("/v1/view", json={
+            "action": "send_message", "session_id": sid, "message": "run pwd",
+        })
+
+        request_id = None
+        for _ in range(50):
+            view = await get_view(client, sid)
+            if view["pending_actions"]:
+                request_id = view["pending_actions"][0]["request_id"]
+                break
+            await asyncio.sleep(0.05)
+
+        assert request_id is not None, "No permission request appeared"
+
+        # Deny the permission
+        await client.post("/v1/view", json={
+            "action": "respond_permission", "session_id": sid,
+            "request_id": request_id, "approved": False,
+        })
+
+        view = await wait_for_session_idle(client, sid)
+
+        # Session should be idle
+        assert view["active_session"]["status"] == "idle"
+
+        # The tool_error should be present
+        error_msgs = [m for m in view["messages"] if m["type"] == "tool_error"]
+        assert len(error_msgs) >= 1
+        assert "denied" in error_msgs[0]["content"].lower()
+
+        # The second LLM response (from keyword "run pwd" sequence) should NOT
+        # appear. The keyword returns turn 1 (tool_use) then turn 2 (text).
+        # After denial, turn 2 text should never be fetched.
+        assistant_text_msgs = [
+            m for m in view["messages"]
+            if m["role"] == "assistant" and m["type"] == "text"
+        ]
+        all_text = " ".join(m["content"] for m in assistant_text_msgs)
+        assert "shown above" not in all_text, (
+            "Agent loop should halt on denial; the second LLM response text "
+            "'The current directory is shown above.' should not appear."
+        )
+
+        # No pending actions
+        assert view["pending_actions"] == []

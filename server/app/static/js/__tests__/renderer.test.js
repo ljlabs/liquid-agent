@@ -293,6 +293,44 @@ describe('renderViewData', () => {
     expect(list.children[1].querySelector('.perm-badge').textContent).toBe('allow');
   });
 
+  it('sets activeSessionId from viewData before rendering session list (Bug 1 fix)', () => {
+    state.activeSessionId = 'sess_OLD';
+    renderViewData({
+      type: 'view',
+      sessions: [
+        { id: 'sess_OLD', title: 'Old Session', updated_at: Date.now() / 1000, status: 'idle', message_count: 0 },
+        { id: 'sess_NEW', title: 'New Session', updated_at: Date.now() / 1000, status: 'idle', message_count: 0 },
+      ],
+      active_session: {
+        id: 'sess_NEW',
+        title: 'New Session',
+        cwd: '/project',
+        model: 'mock-model',
+        permission_mode: 'default',
+        status: 'idle',
+        turn_count: 0,
+        created_at: 0,
+        updated_at: 0,
+      },
+      messages: [],
+      ui_state: {},
+      pending_actions: [],
+      tool_rules: [],
+      files: { changed: [], recently_read: [] },
+      usage: {},
+      tool_call_log: [],
+      session_log: [],
+      available_models: [],
+    });
+
+    expect(state.activeSessionId).toBe('sess_NEW');
+
+    const list = document.getElementById('session-list');
+    const activeItem = list.querySelector('.session-item.active');
+    expect(activeItem).not.toBeNull();
+    expect(activeItem.dataset.session).toBe('sess_NEW');
+  });
+
   it('renders model dropdown', () => {
     renderViewData({
       type: 'view',

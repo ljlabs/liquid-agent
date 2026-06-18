@@ -25,6 +25,11 @@ let lastMessagesHash = '';
 export function renderViewData(viewData) {
   if (!viewData || viewData.type !== 'view') return;
 
+  // Update active session ID before rendering session list so highlights are correct
+  if (viewData.active_session) {
+    state.activeSessionId = viewData.active_session.id;
+  }
+
   renderSessionList(viewData.sessions || []);
 
   if (viewData.active_session) {

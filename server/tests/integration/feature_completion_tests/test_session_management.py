@@ -119,3 +119,54 @@ async def test_get_view_nonexistent_session(client):
     """get_view with bad session_id returns no active_session."""
     view = await get_view(client, "nonexistent")
     assert view["active_session"] is None
+
+
+@pytest.mark.asyncio
+async def test_switch_session_returns_complete_view_data(client):
+    """switch_session returns ViewData with all fields populated for the target session."""
+    # Create two sessions
+    sid1 = await create_session(client, model="m1")
+    sid2 = await create_session(client, model="m2")
+
+    # Send a message to session 1 so it has messages
+    await client.post("/v1/view", json={
+        "action": "send_message", "session_id": sid1, "message": "hello from session 1",
+    })
+
+    # Switch to session 2
+    r = await client.post("/v1/view", json={"action": "switch_session", "session_id": sid2})
+    assert r.status_code == 200
+    data = r.json()
+
+    # Verify all ViewData fields are present and correct
+    assert data["type"] == "view"
+
+    # active_session must point to session 2
+    assert data["active_session"] is not None
+    assert data["active_session"]["id"] == sid2
+    assert data["active_session"]["model"] == "m2"
+    assert data["active_session"]["status"] == "idle"
+
+    # sessions list must include both
+    session_ids = [s["id"] for s in data["sessions"]]
+    assert sid1 in session_ids
+    assert sid2 in session_ids
+
+    # messages should be empty for session 2 (no messages sent)
+    assert data["messages"] == []
+
+    # tool_rules must be present
+    assert len(data["tool_rules"]) > 0
+    rules_by_tool = {r["tool"]: r["rule"] for r in data["tool_rules"]}
+    assert "Bash" in rules_by_tool
+
+    # ui_state must be present
+    assert "streaming" in data["ui_state"]
+    assert "awaiting_approval" in data["ui_state"]
+    assert "mode" in data["ui_state"]
+
+    # pending_actions should be empty
+    assert data["pending_actions"] == []
+
+    # available_models must be present
+    assert len(data["available_models"]) > 0

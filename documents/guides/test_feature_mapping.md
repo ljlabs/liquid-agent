@@ -16,7 +16,7 @@ This document maps every test in the codebase to the features it covers. Tests c
 |-----------|------|------------|
 | `tests/test_main.py` | 🔵 Unit | 12 |
 | `tests/test_sessions.py` | 🔵 Unit | 10 |
-| `tests/test_permissions.py` | 🔵 Unit | 12 |
+| `tests/test_permissions.py` | 🔵 Unit | 14 |
 | `tests/test_view_endpoint.py` | 🟢 Integration | 5 |
 | `tests/test_tool_use_feature.py` | 🟢 Integration | 2 |
 | `tests/test_turn_counting.py` | 🔵 Unit | 2 |
@@ -24,10 +24,10 @@ This document maps every test in the codebase to the features it covers. Tests c
 | `tests/test_integration_permission.py` | 🟢 Integration | 1 |
 | `tests/test_custom_client.py` | 🔵 Unit | 6 |
 | `tests/test_e2e_bash_pwd.py` | 🟡 E2E | 1 |
-| `tests/integration/.../test_session_management.py` | 🟢 Integration | 11 |
+| `tests/integration/.../test_session_management.py` | 🟢 Integration | 12 |
 | `tests/integration/.../test_permissions.py` | 🟢 Integration | 10 |
 | `tests/integration/.../test_view_data_structure.py` | 🟢 Integration | 12 |
-| `tests/integration/.../test_agent_conversation.py` | 🟢 Integration | 7 |
+| `tests/integration/.../test_agent_conversation.py` | 🟢 Integration | 8 |
 | `tests/integration/.../test_view_stream.py` | 🟢 Integration | 5 |
 | `tests/integration/.../test_database_persistence.py` | 🟢 Integration | 8 |
 | `tests/integration/.../test_error_handling.py` | 🟢 Integration | 6 |
@@ -35,7 +35,8 @@ This document maps every test in the codebase to the features it covers. Tests c
 | `tests/integration/.../test_page_refresh.py` | 🟢 Integration | 3 |
 | `tests/integration/.../test_right_drawer.py` | 🟢 Integration | 11 |
 | `tests/integration/.../test_legacy_endpoints.py` | 🟢 Integration | 7 |
-| **Total** | | **118** |
+| `app/static/js/__tests__/renderer.test.js` | 🔵 Unit (JS) | 13 |
+| **Total** | | **123** |
 
 ---
 
@@ -216,6 +217,9 @@ This document maps every test in the codebase to the features it covers. Tests c
 | `test_run_pwd_auto_allow` | `test_agent_conversation.py` | ✅ Loop with auto-allow |
 | `test_echo_keyword_flow` | `test_agent_conversation.py` | ✅ Keyword-based loop |
 | `test_run_ls_deny_flow` | `test_agent_conversation.py` | ✅ Deny exits loop |
+| `test_deny_halts_agent_loop_no_extra_llm_call` | `test_permissions.py` | 🔵 ✅ Deny halts loop, no extra LLM call |
+| `test_deny_halts_resume_after_permission` | `test_permissions.py` | 🔵 ✅ Deny halts _resume_after_permission path |
+| `test_deny_halts_agent_loop_integration` | `test_agent_conversation.py` | 🟢 ✅ Deny halts loop end-to-end |
 
 #### 5.2 Message History
 | Test | File | Covers |
@@ -460,6 +464,8 @@ This document maps every test in the codebase to the features it covers. Tests c
 |------|------|--------|
 | `test_switch_session` | `test_session_management.py` | ✅ Switch restores session |
 | `test_view_stream_switch_session` | `test_view_endpoint.py` | ✅ Switch via stream |
+| `test_switch_session_returns_complete_view_data` | `test_session_management.py` | 🟢 ✅ Switch returns all ViewData fields for target session |
+| `test sets activeSessionId before renderSessionList` | `renderer.test.js` | 🔵 ✅ Session highlight uses correct ID (Bug 1 fix) |
 
 #### 12.2 Message Restoration
 | Test | File | Covers |
@@ -497,8 +503,11 @@ This document maps every test in the codebase to the features it covers. Tests c
 | Test | File | Covers |
 |------|------|--------|
 | `test_mock_tool_deny_prevents_execution` | `test_permissions.py` (unit) | ✅ tool_error on deny |
+| `test_deny_halts_agent_loop_no_extra_llm_call` | `test_permissions.py` (unit) | 🔵 ✅ Deny halts loop, no extra LLM call |
+| `test_deny_halts_resume_after_permission` | `test_permissions.py` (unit) | 🔵 ✅ Deny halts _resume_after_permission |
 | `test_run_pwd_deny_flow` | `test_agent_conversation.py` | ✅ tool_error message |
 | `test_run_ls_deny_flow` | `test_agent_conversation.py` | ✅ tool_error message |
+| `test_deny_halts_agent_loop_integration` | `test_agent_conversation.py` | 🟢 ✅ Deny halts loop end-to-end |
 
 #### 16.2 Frontend Error Display
 *(No frontend unit tests exist)*
@@ -507,7 +516,9 @@ This document maps every test in the codebase to the features it covers. Tests c
 | Test | File | Covers |
 |------|------|--------|
 | `test_mock_tool_deny_prevents_execution` | `test_permissions.py` (unit) | ✅ tool_error event |
+| `test_deny_halts_agent_loop_no_extra_llm_call` | `test_permissions.py` (unit) | 🔵 ✅ tool_error + loop halt |
 | `test_run_pwd_deny_flow` | `test_agent_conversation.py` | ✅ tool_error in messages |
+| `test_deny_halts_agent_loop_integration` | `test_agent_conversation.py` | 🟢 ✅ tool_error + loop halt (E2E) |
 
 ---
 

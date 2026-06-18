@@ -294,6 +294,12 @@ class Session:
             "content": tool_results,
         })
 
+        # If permission was denied, halt the agent loop and wait for user input.
+        if not approved:
+            self.status = "idle"
+            await self._emit_event({"type": "result", "num_turns": 0})
+            return
+
         # Continue the LLM loop
         await self._continue_agent_loop()
 
@@ -552,6 +558,7 @@ class Session:
 
             # Handle tool calls
             tool_results = []
+            all_denied = True
             for tool_use in tool_uses:
                 tool_id = tool_use.get("id")
                 tool_name = tool_use.get("name")
@@ -618,6 +625,7 @@ class Session:
                     allowed = result.get("approved", False)
                 
                 if allowed:
+                    all_denied = False
                     result = await execute_tool(tool_name, tool_input, cwd=self.cwd)
                     if result.is_error:
                         yield {"type": "tool_error", "tool_id": tool_id, "error": result.error}
@@ -648,6 +656,11 @@ class Session:
                 "role": "user",
                 "content": tool_results
             })
+
+            # If all tool calls were denied, halt the agent loop and wait
+            # for user input instead of sending the error back to the LLM.
+            if all_denied:
+                break
 
             # Continue to next turn - call LLM again with tool results
             if not self._interrupt_flag and tool_results:

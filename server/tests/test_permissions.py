@@ -259,6 +259,135 @@ async def test_mock_tool_deny_prevents_execution():
 
 
 @pytest.mark.asyncio
+async def test_deny_halts_agent_loop_no_extra_llm_call():
+    """When a tool call is denied, the agent loop should halt immediately.
+
+    After denial the loop should NOT call the LLM again. The MockLLM
+    tracks how many times chat_completion was called.
+    """
+    with mock.patch("app.sessions.CustomLLMWrapper", MockLLM):
+        session = Session(session_id="test_deny_halt", cwd="/tmp", permission_mode="default")
+
+        mock_llm = session._llm
+        mock_llm.set_sequence([
+            {
+                "content": [
+                    {"type": "text", "text": "I'll run that."},
+                    {"type": "tool_use", "id": "tool_1", "name": "Bash", "input": {"command": "echo hello"}},
+                ],
+                "stop_reason": "tool_use",
+            },
+            # This should NOT be reached after denial
+            {
+                "content": [{"type": "text", "text": "This should not appear."}],
+                "stop_reason": "end_turn",
+            },
+        ])
+
+        call_count = 0
+        original_chat = mock_llm.chat_completion
+
+        async def counting_chat(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            async for chunk in original_chat(*args, **kwargs):
+                yield chunk
+
+        mock_llm.chat_completion = counting_chat
+
+        events = []
+        async def collect():
+            async for ev in session.run_turn("test deny halt"):
+                events.append(ev)
+
+        task = asyncio.create_task(collect())
+        await asyncio.sleep(0.15)
+
+        assert len(session._pending_permissions) == 1
+        req_id = list(session._pending_permissions.keys())[0]
+
+        session.resolve_permission(req_id, approved=False)
+        await asyncio.sleep(0.15)
+        await task
+
+        # The LLM should have been called exactly once (the initial tool_use response)
+        assert call_count == 1, f"Expected 1 LLM call, got {call_count}"
+
+        # The loop should have halted — no "This should not appear." text
+        text_events = [e for e in events if e["type"] == "text"]
+        all_text = "".join(e["data"] for e in text_events)
+        assert "This should not appear" not in all_text
+
+        # Session should be idle
+        assert session.status == "idle"
+
+
+@pytest.mark.asyncio
+async def test_deny_halts_resume_after_permission():
+    """When permission is denied via _resume_after_permission (idle session),
+    the agent loop should NOT continue. The session stays idle."""
+    with mock.patch("app.sessions.CustomLLMWrapper", MockLLM):
+        session = Session(session_id="test_resume_deny", cwd="/tmp", permission_mode="default")
+
+        mock_llm = session._llm
+        mock_llm.set_sequence([
+            {
+                "content": [
+                    {"type": "text", "text": "Running tool."},
+                    {"type": "tool_use", "id": "tool_1", "name": "Bash", "input": {"command": "echo hello"}},
+                ],
+                "stop_reason": "tool_use",
+            },
+            # This should NOT be reached
+            {
+                "content": [{"type": "text", "text": "Extra response."}],
+                "stop_reason": "end_turn",
+            },
+        ])
+
+        call_count = 0
+        original_chat = mock_llm.chat_completion
+
+        async def counting_chat(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            async for chunk in original_chat(*args, **kwargs):
+                yield chunk
+
+        mock_llm.chat_completion = counting_chat
+
+        events = []
+        async def collect():
+            async for ev in session.run_turn("test resume deny"):
+                events.append(ev)
+
+        task = asyncio.create_task(collect())
+        await asyncio.sleep(0.15)
+
+        assert len(session._pending_permissions) == 1
+        req_id = list(session._pending_permissions.keys())[0]
+
+        # Set session to idle (simulating page refresh scenario)
+        session.status = "idle"
+
+        # Resolve with deny — this triggers _resume_after_permission
+        session.resolve_permission(req_id, approved=False)
+        await asyncio.sleep(0.3)
+        await task
+
+        # LLM should have been called only once (the initial tool_use)
+        assert call_count == 1, f"Expected 1 LLM call, got {call_count}"
+
+        # Session should still be idle
+        assert session.status == "idle"
+
+        # No extra text from the denied path
+        text_events = [e for e in events if e["type"] == "text"]
+        all_text = "".join(e["data"] for e in text_events)
+        assert "Extra response" not in all_text
+
+
+@pytest.mark.asyncio
 async def test_mock_tool_allow_runs_without_prompt(mock_execute_tool):
     """If Bash is set to 'allow', the agent should skip the permission prompt."""
     with mock.patch("app.sessions.CustomLLMWrapper", MockLLM):

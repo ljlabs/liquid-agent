@@ -146,8 +146,9 @@ This guide provides an exhaustive inventory of every feature in the Model Contai
 ### 5.1 Turn Loop (`run_turn`)
 - Runs a while loop up to `max_turns` iterations (default 25).
 - Each iteration calls the LLM, processes the response, and handles tool calls.
-- Loop exits early if: interrupt flag is set, no tool uses in response, or max turns reached.
+- Loop exits early if: interrupt flag is set, no tool uses in response, max turns reached, or **all tool calls in a turn were denied**.
 - On completion, emits `{"type": "result", "num_turns": N}` and sets status to `"idle"`.
+- **Known issue (fixed):** Previously, when a tool call was denied, the error result was sent back to the LLM which could produce another response or tool call. The fix adds an `all_denied` flag that breaks the loop when every tool in a turn is denied, halting the agent and waiting for user input.
 
 ### 5.2 Message History
 - User messages are appended as `{"role": "user", "content": "text"}`.
@@ -532,6 +533,7 @@ This guide provides an exhaustive inventory of every feature in the Model Contai
 - Updates `localStorage` with the new session ID.
 - Loads session tool rules from the database.
 - Fetches and renders all persisted messages.
+- **Known issue (fixed):** Previously, `state.activeSessionId` was updated after `renderSessionList()`, causing the session highlight to be one behind. The fix updates `state.activeSessionId` from `viewData.active_session` before rendering the session list in `renderViewData()`.
 
 ### 12.2 Message Restoration
 - User messages rendered with markdown parsing.
