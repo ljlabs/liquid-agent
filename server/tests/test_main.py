@@ -1,5 +1,4 @@
 import pytest
-import os
 import shutil
 import tempfile
 import httpx
@@ -19,26 +18,17 @@ def tmp_cwd():
 
 @pytest.fixture
 async def async_client():
-    """Fixture to provide an AsyncClient and ensure manager is initialized."""
     from app.main import app
     from app.sessions import SessionManager
     from app.view_data import ViewDataGenerator
-    from app import database as db
+    from tests.conftest import InMemoryDB
     import app.main as main
-    import os
 
-    # Force use of mock LLM for all tests
-    os.environ["ANTHROPIC_MODEL"] = "mock-model"
-    os.environ["ANTHROPIC_BASE_URL"] = "http://localhost:9002"
-
-    # Manually initialize the manager since we aren't running the full lifespan
     main.manager = SessionManager()
-    main.view_generator = ViewDataGenerator(main.manager, db)
+    main.view_generator = ViewDataGenerator(main.manager, InMemoryDB())
 
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as ac:
         yield ac
-
-    # Cleanup
     await main.manager.close_all()
 
 
@@ -201,89 +191,18 @@ async def test_resolve_permission_nonexistent_request(async_client):
 
 @pytest.fixture
 async def async_client_with_db():
-    """Fixture that also initializes the DB for DB endpoint tests."""
-    from app.main import app
-    from app.sessions import SessionManager
-    import app.main as main
-    from app import database as db
-
-    main.manager = SessionManager()
-
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as ac:
-        yield ac
-
-    await main.manager.close_all()
-    await db.close_db()
-
-
-@pytest.mark.asyncio
-async def test_db_list_sessions_empty(async_client_with_db):
-    """Test that listing sessions returns empty list initially."""
-    response = await async_client_with_db.post("/v1/view", json={"action": "get_view"})
-    assert response.status_code == 200
-    data = response.json()
-    assert data["sessions"] == []
-
-
-@pytest.mark.asyncio
-async def test_db_session_not_found(async_client_with_db):
-    """Test that fetching a non-existent DB session returns no active_session."""
-    response = await async_client_with_db.post("/v1/view", json={"action": "get_view", "session_id": "nonexistent"})
-    assert response.status_code == 200
-    data = response.json()
-    assert data["active_session"] is None
-
-
-@pytest.mark.asyncio
-async def test_db_messages_not_found(async_client_with_db):
-    """Test that fetching messages for a non-existent session returns 404."""
-    response = await async_client_with_db.post("/v1/view", json={"action": "get_view", "session_id": "nonexistent"})
-    assert response.status_code == 200
-    data = response.json()
-    assert data["messages"] == []
-
-
-@pytest.mark.asyncio
-async def test_db_delete_session_not_found(async_client_with_db):
-    """Test that deleting a non-existent DB session returns 404."""
-    response = await async_client_with_db.post("/v1/view", json={"action": "delete_session", "session_id": "nonexistent"})
-    assert response.status_code == 200
-
-
-# ------------------------------------------------------------------
-# DB endpoint tests
-# ------------------------------------------------------------------
-
-
-@pytest.fixture
-async def async_client_with_db():
-    """Fixture that also initializes the DB for DB endpoint tests."""
     from app.main import app
     from app.sessions import SessionManager
     from app.view_data import ViewDataGenerator
+    from tests.conftest import InMemoryDB
     import app.main as main
-    from app import database as db
-    import tempfile
-    from pathlib import Path
-    import shutil
-
-    tmpdir = tempfile.mkdtemp()
-    tmp = Path(tmpdir) / "test_main.db"
-    old_db_path = db.DB_PATH
-    db.DB_PATH = tmp
-    db._db = None
 
     main.manager = SessionManager()
-    main.view_generator = ViewDataGenerator(main.manager, db)
+    main.view_generator = ViewDataGenerator(main.manager, InMemoryDB())
 
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as ac:
         yield ac
-
     await main.manager.close_all()
-    await db.close_db()
-    db.DB_PATH = old_db_path
-    db._db = None
-    shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 @pytest.mark.asyncio

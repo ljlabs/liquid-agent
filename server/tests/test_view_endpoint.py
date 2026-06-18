@@ -8,16 +8,17 @@ from app.main import app
 from app.sessions import SessionManager
 from app.view_data import ViewDataGenerator
 import app.main as main
-from app import database as db
+from tests.conftest import InMemoryDB
 
 
 @pytest.fixture
 async def async_client():
     main.manager = SessionManager()
-    main.view_generator = ViewDataGenerator(main.manager, db)
+    main.view_generator = ViewDataGenerator(main.manager, InMemoryDB())
 
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as ac:
         yield ac
+    await main.manager.close_all()
 
 
 @pytest.mark.asyncio

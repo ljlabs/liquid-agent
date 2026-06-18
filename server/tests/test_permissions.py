@@ -1,10 +1,7 @@
 import pytest
-import tempfile
-import shutil
 import asyncio
 import json
 import httpx
-from pathlib import Path
 from unittest import mock
 from app.sessions import (
     Session,
@@ -12,7 +9,6 @@ from app.sessions import (
     DEFAULT_TOOL_RULES,
     DEFAULT_AUTO_ALLOW_TOOLS,
 )
-from app import database as db
 from app.main import app
 
 
@@ -38,20 +34,6 @@ class MockLLM:
                 "content": [{"type": "text", "text": "Done."}],
                 "stop_reason": "end_turn",
             }
-
-
-@pytest.fixture
-async def temp_db():
-    tmpdir = tempfile.mkdtemp()
-    tmp = Path(tmpdir) / "test_perm.db"
-    old_db_path = db.DB_PATH
-    db.DB_PATH = tmp
-    db._db = None
-    yield tmp
-    await db.close_db()
-    db.DB_PATH = old_db_path
-    db._db = None
-    shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ------------------------------------------------------------------
@@ -198,7 +180,7 @@ async def test_case_insensitive_tool_rules():
 
 
 @pytest.mark.asyncio
-async def test_mock_tool_permission_request(temp_db):
+async def test_mock_tool_permission_request(mock_execute_tool):
     """send_message with a tool_use response triggers a pending permission and blocks."""
     with mock.patch("app.sessions.CustomLLMWrapper", MockLLM):
         session = Session(session_id="test_mock_tool", cwd="/tmp", permission_mode="default")
@@ -240,7 +222,7 @@ async def test_mock_tool_permission_request(temp_db):
 
 
 @pytest.mark.asyncio
-async def test_mock_tool_deny_prevents_execution(temp_db):
+async def test_mock_tool_deny_prevents_execution():
     """If the user denies a tool, the agent should emit tool_error."""
     with mock.patch("app.sessions.CustomLLMWrapper", MockLLM):
         session = Session(session_id="test_mock_deny", cwd="/tmp", permission_mode="default")
@@ -277,7 +259,7 @@ async def test_mock_tool_deny_prevents_execution(temp_db):
 
 
 @pytest.mark.asyncio
-async def test_mock_tool_allow_runs_without_prompt(temp_db):
+async def test_mock_tool_allow_runs_without_prompt(mock_execute_tool):
     """If Bash is set to 'allow', the agent should skip the permission prompt."""
     with mock.patch("app.sessions.CustomLLMWrapper", MockLLM):
         session = Session(session_id="test_mock_allow", cwd="/tmp", permission_mode="default")
@@ -313,7 +295,7 @@ async def test_mock_tool_allow_runs_without_prompt(temp_db):
 
 
 @pytest.fixture
-async def test_app_client(temp_db):
+async def test_app_client():
     import app.main as main
     main.manager = SessionManager()
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as ac:
@@ -358,7 +340,7 @@ async def test_http_session_tool_rules(test_app_client):
 
 
 @pytest.mark.asyncio
-async def test_http_resolve_permission(test_app_client):
+async def test_http_resolve_permission(test_app_client, mock_execute_tool):
     """Test the HTTP endpoint for resolving permissions via the stream endpoint."""
     with mock.patch("app.sessions.CustomLLMWrapper", MockLLM):
         resp = await test_app_client.post("/v1/sessions", json={"cwd": "/tmp", "model": "mock-model"})

@@ -4,7 +4,6 @@ import asyncio
 from unittest.mock import MagicMock, AsyncMock, patch
 from app.sessions import Session, SessionManager
 from app.view_data import ViewDataGenerator, SessionView
-from app import database
 
 @pytest.mark.asyncio
 async def test_session_turn_count_calculation():

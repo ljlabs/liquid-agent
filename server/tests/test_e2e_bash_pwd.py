@@ -29,7 +29,7 @@ class MockLLMPwd:
 
 
 @pytest.mark.asyncio
-async def test_e2e_bash_pwd_permission_flow():
+async def test_e2e_bash_pwd_permission_flow(mock_execute_tool):
     """
     Test that 'Bash(pwd)' blocks for permission and only returns the result after approval.
     """

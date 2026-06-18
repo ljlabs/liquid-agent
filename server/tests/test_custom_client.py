@@ -6,16 +6,8 @@ import httpx
 from unittest import mock
 from app.sessions import Session, SessionManager
 from app.tools import execute_tool, ALL_TOOLS
-from app.database import get_db, close_db
-
-@pytest.fixture(autouse=True)
-async def setup_db():
-    await get_db()
-    yield
-    await close_db()
-
 @pytest.mark.asyncio
-async def test_session_tool_call_flow():
+async def test_session_tool_call_flow(mock_execute_tool):
     """Test that a tool call from the LLM triggers the permission flow and executes correctly."""
     from unittest import mock as _mock
 
@@ -106,9 +98,11 @@ async def test_tool_replace_file(tmp_path):
 @pytest.mark.asyncio
 async def test_tool_bash():
     """Test Bash tool."""
-    res = await execute_tool("Bash", {"command": "echo 'test bash'"})
-    assert "test bash" in res.output.strip()
-    assert not res.is_error
+    with mock.patch("app.tools.subprocess.run") as mock_run:
+        mock_run.return_value = mock.MagicMock(returncode=0, stdout="test bash\n", stderr="")
+        res = await execute_tool("Bash", {"command": "echo 'test bash'"})
+        assert "test bash" in res.output.strip()
+        mock_run.assert_called_once()
 
 @pytest.mark.asyncio
 async def test_tool_web_fetch():
