@@ -12,11 +12,18 @@ async def test_real_sdk_permission_callback(mock_llm_server):
     Uses the mock LLM server started by conftest.
     """
     # Reset mock server state before test
+    os.environ["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{mock_llm_server}"
+    os.environ["ANTHROPIC_MODEL"] = "mock-model"
+    os.environ["ANTHROPIC_API_KEY"] = "sk-no-key-needed"
     async with httpx.AsyncClient() as c:
         await c.post(f"http://127.0.0.1:{mock_llm_server}/reset", timeout=10)
 
-    session_id = "test_integration_perm"
+    import uuid
+    session_id = f"test_perm_{uuid.uuid4().hex[:8]}"
     cwd = os.getcwd()
+
+    from app import database as test_db
+    await test_db.create_session(session_id=session_id, title="Test", cwd=cwd, model="mock-model")
 
     session = Session(session_id=session_id, cwd=cwd, permission_mode="default", model="mock-model")
     session.set_tool_rule("Bash", "ask")
@@ -42,3 +49,6 @@ async def test_real_sdk_permission_callback(mock_llm_server):
     session.resolve_permission(req_id, approved=True)
 
     await asyncio.wait_for(turn_task, timeout=5)
+
+    # Cleanup
+    await test_db.delete_session(session_id)

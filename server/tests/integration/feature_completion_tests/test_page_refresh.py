@@ -60,6 +60,9 @@ async def test_pending_permission_survives_session_removal(client, manager, view
 
         assert request_id is not None
 
+        # Wait for the async DB write of the pending permission to complete
+        await asyncio.sleep(0.5)
+
         # Simulate page refresh: drop all in-memory sessions
         sessions_resp = await client.get("/v1/sessions")
         for s in sessions_resp.json()["sessions"]:
@@ -68,6 +71,12 @@ async def test_pending_permission_survives_session_removal(client, manager, view
         # Verify no in-memory sessions
         sessions_resp = await client.get("/v1/sessions")
         assert len(sessions_resp.json()["sessions"]) == 0
+
+        # Restore session from DB to verify pending permissions survived
+        r = await client.post("/v1/view", json={
+            "action": "switch_session", "session_id": sid,
+        })
+        assert r.status_code == 200
 
         # Pending permission must survive in DB
         r = await client.get(f"/v1/sessions/{sid}/pending-permissions")

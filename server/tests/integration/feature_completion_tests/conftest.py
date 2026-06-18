@@ -152,13 +152,23 @@ class MockLLMClient:
         pass
 
     def _pick_response(self, messages: list[dict]) -> dict:
-        """Choose a response: keyword match > explicit sequence > default."""
+        """Choose a response: explicit sequence > keyword match > default."""
         prompt = _extract_prompt(messages)
+
+        # explicit sequence — takes priority when set
+        if self._sequence:
+            idx = min(self._seq_index, len(self._sequence) - 1)
+            resp = dict(self._sequence[idx])
+            resp["content"] = [dict(b) for b in resp.get("content", [])]
+            self._seq_index += 1
+            for block in resp.get("content", []):
+                if block.get("type") == "tool_use":
+                    block["id"] = f"toolu_{uuid.uuid4().hex[:8]}"
+            return resp
 
         # keyword routing — each keyword fires at most once
         kw = _keyword_response(prompt)
         if kw:
-            # Find which keyword matched
             matched_kw = None
             for kw_str in ("run pwd", "run ls", "echo", "delete", "rm ", "edit"):
                 if kw_str in prompt:
@@ -168,26 +178,16 @@ class MockLLMClient:
             if matched_kw and matched_kw not in self._kw_fired:
                 self._kw_fired.add(matched_kw)
                 resp = dict(kw[0])
+                resp["content"] = [dict(b) for b in resp.get("content", [])]
                 for block in resp.get("content", []):
                     if block.get("type") == "tool_use":
                         block["id"] = f"toolu_{uuid.uuid4().hex[:8]}"
                 return resp
 
-            # Keyword already fired — return终结 text so the loop ends
             return {
                 "content": [{"type": "text", "text": "Done."}],
                 "stop_reason": "end_turn",
             }
-
-        # explicit sequence
-        if self._sequence:
-            idx = min(self._seq_index, len(self._sequence) - 1)
-            resp = dict(self._sequence[idx])
-            self._seq_index += 1
-            for block in resp.get("content", []):
-                if block.get("type") == "tool_use":
-                    block["id"] = f"toolu_{uuid.uuid4().hex[:8]}"
-            return resp
 
         # default: plain text
         return {

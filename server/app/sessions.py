@@ -587,13 +587,13 @@ class Session:
                         }
 
                         # Persist to database so it survives page refresh
-                        asyncio.create_task(db.store_pending_permission(
+                        await db.store_pending_permission(
                             session_id=self.session_id,
                             request_id=request_id,
                             tool_name=tool_name,
                             tool_id=tool_id,
                             tool_input=json.dumps(tool_input, default=str),
-                        ))
+                        )
 
                 yield {
                     "type": "tool_use",

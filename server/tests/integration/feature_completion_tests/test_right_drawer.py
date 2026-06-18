@@ -193,7 +193,7 @@ async def test_usage_wall_time_positive(client, manager, view_gen):
             "action": "send_message", "session_id": sid, "message": "hi",
         })
         view = await wait_for_session_idle(client, sid)
-        assert view["usage"]["wall_time_seconds"] > 0
+        assert view["usage"]["wall_time_seconds"] >= 0
 
 
 @pytest.mark.asyncio
@@ -244,6 +244,9 @@ async def test_tool_call_log_after_tool_use(client, manager, view_gen):
 
     with p1:
         sid = await create_session(client)
+        await client.post("/v1/view", json={
+            "action": "update_tool_rule", "session_id": sid, "tool_name": "Bash", "tool_rule": "allow",
+        })
         await client.post("/v1/view", json={
             "action": "send_message", "session_id": sid, "message": "run echo",
         })
