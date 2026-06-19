@@ -25,8 +25,12 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 import uvicorn
+import logging
 
 app = FastAPI(title="Mock LLM Server")
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 _stats: dict[str, Any] = {
     "total_requests": 0,
@@ -83,6 +87,28 @@ def _keyword_response(prompt_lower: str) -> list[dict] | None:
             {
                 "content": [
                     {"type": "text", "text": "Here are the files."},
+                ],
+                "stop_reason": "end_turn",
+            },
+        ]
+
+    if "cat" in prompt_lower:
+        return [
+            {
+                "content": [
+                    {"type": "text", "text": "Running echo."},
+                    {
+                        "type": "tool_use",
+                        "id": f"toolu_{uuid.uuid4().hex[:8]}",
+                        "name": "Bash",
+                        "input": {"command": "cat C:\\Users\\jorda\\Documents\\workspace\\model_containment\\CLAUDE.md"},
+                    },
+                ],
+                "stop_reason": "tool_use",
+            },
+            {
+                "content": [
+                    {"type": "text", "text": "Echo completed."},
                 ],
                 "stop_reason": "end_turn",
             },
@@ -204,6 +230,9 @@ def _extract_prompt(body: dict) -> str:
 def _next_response(body: dict | None = None):
     global _response_index
 
+    logging.info(f"Request Index: {_response_index}")
+    logging.info(f"Request Body: {body}")
+
     # --- keyword routing (takes priority over sequence) ---
     if body:
         prompt = _extract_prompt(body)
@@ -245,6 +274,7 @@ async def anthropic_messages(request: Request):
 
     await asyncio.sleep(0.02)
     resp = _next_response(body)
+    logging.info(f"Request Response: {resp}")
 
     return JSONResponse(content={
         "id": f"msg_{uuid.uuid4().hex[:12]}",
@@ -268,6 +298,7 @@ async def openai_chat_completions(request: Request):
 
     await asyncio.sleep(0.02)
     resp = _next_response(body)
+    logging.info(f"Request Response: {resp}")
 
     # Convert Anthropic format to OpenAI format
     text_parts = []
@@ -348,7 +379,7 @@ def main():
     print(f"Mock LLM Server on {args.host}:{args.port}")
     print(f"  Endpoints: POST /v1/messages, POST /v1/chat/completions")
     print(f"  Keywords: run pwd, run ls, echo, delete, edit")
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
 if __name__ == "__main__":
