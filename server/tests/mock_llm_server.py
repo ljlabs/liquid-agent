@@ -314,6 +314,7 @@ async def list_models():
     })
 
 
+@app.get("/reset")
 @app.post("/reset")
 async def reset():
     global _response_index

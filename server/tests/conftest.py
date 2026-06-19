@@ -160,11 +160,11 @@ def mock_system_prompt(request):
 
 @pytest.fixture(autouse=True)
 def isolate_env(request, monkeypatch):
-    """Set env vars via monkeypatch so they are automatically restored (unit tests only)."""
+    """Set env vars via monkeypatch so they are automatically restored."""
+    monkeypatch.setenv("ANTHROPIC_MODEL", "mock-model")
     if _is_integration_test(request):
         yield
         return
-    monkeypatch.setenv("ANTHROPIC_MODEL", "mock-model")
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://localhost:1")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-no-key-needed")
     yield
