@@ -101,7 +101,7 @@ def _keyword_response(prompt_lower: str) -> list[dict] | None:
                         "type": "tool_use",
                         "id": f"toolu_{uuid.uuid4().hex[:8]}",
                         "name": "Bash",
-                        "input": {"command": "cat C:\\Users\\jorda\\Documents\\workspace\\model_containment\\CLAUDE.md"},
+                        "input": {"command": "cat C:/Users/jorda/Documents/workspace/model_containment/CLAUDE.md"},
                     },
                 ],
                 "stop_reason": "tool_use",
@@ -210,21 +210,29 @@ def _default_sequence():
 
 
 def _extract_prompt(body: dict) -> str:
-    """Pull a plain-text prompt from an Anthropic Messages API body."""
+    """Find the most recent plain-text prompt typed by the user."""
     messages = body.get("messages", [])
-    parts = []
-    for msg in messages:
+    
+    # Iterate backward through history
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            continue
+            
         content = msg.get("content", "")
+        parts = []
+        
         if isinstance(content, str):
             parts.append(content)
         elif isinstance(content, list):
             for block in content:
-                if isinstance(block, dict):
-                    if block.get("type") == "text":
-                        parts.append(block.get("text", ""))
-                    elif block.get("type") == "tool_result":
-                        parts.append(str(block.get("content", "")))
-    return " ".join(parts).lower()
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+        
+        # If we found actual text in this user turn, return it
+        if parts:
+            return " ".join(parts).strip().lower()
+            
+    return ""
 
 
 def _next_response(body: dict | None = None):
